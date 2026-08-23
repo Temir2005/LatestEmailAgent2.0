@@ -1,0 +1,61 @@
+# Три роли на одном образе плюс база.
+#
+#   docker compose up -d db worker web     → хранилище, дозагрузка, интерфейс
+#   docker compose run --rm agent cases    → разовая команда в терминале
+x-app: &app
+  build: .
+  image: clinic-agent
+  # Ключи и учётка ящика — из .env рядом с этим файлом.
+  # Keychain внутри контейнера недоступен, только переменные окружения.
+  env_file: .env
+  environment:
+    CLINIC_DATABASE_URL: postgres://clinic:clinic@db:5432/clinic
+  depends_on:
+    db:
+      condition: service_healthy
+  volumes:
+    # Для .eml-архивов с хоста: bun run sync --eml /mail
+    - ./mail:/mail:ro
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: clinic
+      POSTGRES_PASSWORD: clinic
+      POSTGRES_DB: clinic
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      # Наружу — чтобы ходить psql'ем с хоста и запускать код вне контейнера.
+      - "${PG_PORT:-5434}:5432"
+    healthcheck:
+      # Остальные сервисы стартуют только когда база реально принимает запросы.
+      test: ["CMD-SHELL", "pg_isready -U clinic -d clinic"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # Демон: держит IMAP-соединение открытым и складывает новые письма в базу.
+  worker:
+    <<: *app
+    entrypoint: ["bun", "run", "src/ingest/watcher.ts"]
+    restart: unless-stopped
+
+  web:
+    <<: *app
+    # ENTRYPOINT образа ведёт в роутер CLI — для сервера подменяем его.
+    entrypoint: ["bun", "run", "src/web/server.ts"]
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    restart: unless-stopped
+
+  agent:
+    <<: *app
+    # Нужно для интерактивных команд: chat и clarify спрашивают с клавиатуры.
+    stdin_open: true
+    tty: true
+
+volumes:
+  pgdata:

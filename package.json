@@ -1,0 +1,33 @@
+{
+  "name": "clinic-agent",
+  "version": "0.1.0",
+  "description": "Агент для переписки с медицинскими клиниками: цепочки по RFC-заголовкам, тематические кейсы, уточняющие вопросы",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "help": "bun run src/cli/index.ts help",
+    "web": "bun run src/web/server.ts",
+    "watch": "bun run src/ingest/watcher.ts",
+    "migrate:sqlite": "bun run scripts/migrate-sqlite-to-pg.ts",
+    "auth": "bun run auth-service/src/cli.ts",
+    "seed": "bun run src/cli/index.ts seed",
+    "sync": "bun run src/cli/index.ts sync",
+    "cases": "bun run src/cli/index.ts cases",
+    "case": "bun run src/cli/index.ts case",
+    "clarify": "bun run src/cli/index.ts clarify",
+    "chat": "bun run src/cli/index.ts chat",
+    "draft": "bun run src/cli/index.ts draft",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.120.0",
+    "mailparser": "^3.7.4",
+    "node-imap": "^0.9.6"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.21",
+    "@types/mailparser": "^3.4.6",
+    "@types/node-imap": "^0.9.3",
+    "typescript": "^5.9.2"
+  }
+}

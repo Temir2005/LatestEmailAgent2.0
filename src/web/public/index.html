@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AAAG · Агент переписки с клиниками</title>
+<link rel="icon" href="logo.svg" type="image/svg+xml">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div class="app">
+  <div class="rule"></div>
+
+  <header class="head">
+    <a class="logo" href="#/cases" title="Alatau Advance Air Group">
+      <svg viewBox="0 0 232 74" aria-label="AAAG">
+        <g fill="currentColor">
+          <path d="M0 66 L30 6 L42 6 L72 66 L54 66 L36 28 L18 66 Z"/>
+          <path d="M46 66 L76 6 L88 6 L118 66 L100 66 L82 28 L64 66 Z"/>
+          <path d="M92 66 L122 6 L134 6 L164 66 L146 66 L128 28 L110 66 Z"/>
+          <path d="M200 6 a30 30 0 1 0 0 60 h30 V33 h-30 v14 h14 v5 a17 17 0 1 1 0-32 h16 V6 Z"/>
+          <rect x="0" y="36" width="232" height="11"/>
+        </g>
+      </svg>
+      <span class="full">Alatau Advance Air Group</span>
+    </a>
+
+    <div>
+      <h1>Агент переписки с медицинскими клиниками</h1>
+      <p class="sub">Цепочки по техническим заголовкам · тематические дела · уточняющие вопросы</p>
+    </div>
+
+    <div class="slogan">
+      <b>Переосмысление возможного</b>
+      <span id="provider">—</span>
+    </div>
+  </header>
+
+  <nav class="nav">
+    <div class="nav-title">Разбор</div>
+    <button class="nav-item" data-route="cases">Дела <span class="count" id="n-cases">0</span></button>
+    <button class="nav-item" data-route="clarify">Вопросы агента <span class="count" id="n-pending">0</span></button>
+    <button class="nav-item" data-route="threads">Цепочки писем <span class="count" id="n-threads">0</span></button>
+
+    <div class="nav-title">Работа</div>
+    <button class="nav-item" data-route="chat">Чат по переписке</button>
+    <button class="nav-item" data-route="sources">Источники писем</button>
+
+    <div class="nav-foot">
+      <div class="watcher" id="watcher">
+        <span class="dot" id="watch-dot"></span>
+        <span id="watch-text">дозагрузка: —</span>
+      </div>
+      писем в базе: <b id="n-emails">0</b><br>
+      рассылок отсеяно: <b id="n-bulk">0</b><br>
+      ваш адрес: <b id="self">—</b>
+    </div>
+  </nav>
+
+  <main class="main">
+
+    <!-- ─── Дела ─────────────────────────────────────────────────────── -->
+    <section class="view" id="v-cases">
+      <div class="view-head">
+        <div>
+          <h2>Тематические дела</h2>
+          <p>Переписка, разложенная по смыслу. Одно дело может собирать несколько технических
+             цепочек — и наоборот, одна цепочка может распасться на два дела.</p>
+        </div>
+        <div class="actions">
+          <button class="btn" id="b-reanalyze">Разобрать заново</button>
+        </div>
+      </div>
+      <div id="cases-list"></div>
+    </section>
+
+    <!-- ─── Карточка дела ────────────────────────────────────────────── -->
+    <section class="view" id="v-case" hidden>
+      <div class="view-head">
+        <div>
+          <button class="btn ghost small" id="b-back">← Все дела</button>
+          <h2 id="case-topic" style="margin-top:10px">—</h2>
+          <p id="case-clinic"></p>
+        </div>
+        <div class="actions">
+          <button class="btn" id="b-draft">Черновик ответа</button>
+          <button class="btn primary" id="b-case-chat">Спросить агента</button>
+        </div>
+      </div>
+      <div id="case-body"></div>
+    </section>
+
+    <!-- ─── Вопросы ──────────────────────────────────────────────────── -->
+    <section class="view" id="v-clarify" hidden>
+      <div class="view-head">
+        <div>
+          <h2>Агент не смог разобраться сам</h2>
+          <p>Когда письмо непонятно контекстно, агент не угадывает, а спрашивает.
+             Ответ становится фактом и подмешивается во все дальнейшие разборы —
+             один и тот же вопрос второй раз не задаётся.</p>
+        </div>
+      </div>
+      <div id="clarify-list"></div>
+      <div id="facts-block"></div>
+    </section>
+
+    <!-- ─── Цепочки ──────────────────────────────────────────────────── -->
+    <section class="view" id="v-threads" hidden>
+      <div class="view-head">
+        <div>
+          <h2>Технические цепочки</h2>
+          <p>Уровень без ИИ: письма связаны по <b>Message-ID</b>, <b>In-Reply-To</b> и
+             <b>References</b> (RFC 5322). Где заголовков не хватило, цепочка собрана
+             эвристикой — тема, участники, окно по времени — и помечена честно.</p>
+        </div>
+      </div>
+      <div id="threads-table"></div>
+    </section>
+
+    <!-- ─── Чат ──────────────────────────────────────────────────────── -->
+    <section class="view" id="v-chat" hidden>
+      <div class="view-head">
+        <div>
+          <h2 id="chat-title">Чат по всей переписке</h2>
+          <p id="chat-sub">Агент видит сводки всех дел. Для деталей конкретного дела откройте его карточку.</p>
+        </div>
+        <div class="actions">
+          <button class="btn ghost small" id="b-chat-clear">Очистить</button>
+        </div>
+      </div>
+      <div class="chat-log" id="chat-log"></div>
+      <form class="chat-form" id="chat-form">
+        <textarea id="chat-input" placeholder="Спросите про переписку… (Enter — отправить, Shift+Enter — новая строка)"></textarea>
+        <button class="btn primary" type="submit">Отправить</button>
+      </form>
+    </section>
+
+    <!-- ─── Источники ────────────────────────────────────────────────── -->
+    <section class="view" id="v-sources" hidden>
+      <div class="view-head">
+        <div>
+          <h2>Источники писем</h2>
+          <p>Демо-корпус — готовая тест-фикстура с намеренно поломанным threading.
+             IMAP — ваш реальный ящик, доступ только на чтение.</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <p class="panel-title">Демо-корпус</p>
+        <p style="margin:0 0 12px">10 писем от трёх организаций: корректная цепочка с References,
+           счёт от noreply без заголовков, разорванная посередине цепочка, письмо с двумя разными
+           вопросами и письмо без контекста вовсе. На нём видно всё поведение агента сразу.</p>
+        <button class="btn primary" id="b-demo">Загрузить демо-корпус</button>
+      </div>
+
+      <div class="card">
+        <p class="panel-title">Живой ящик по IMAP</p>
+        <p style="margin:0 0 12px">Читает почту по учётным данным из <code>.env</code>.
+           Письма не удаляются и не помечаются прочитанными. Массовые рассылки отсеиваются
+           по заголовкам <code>List-Unsubscribe</code> и <code>Precedence</code> ещё до разбора.</p>
+        <div class="q-form">
+          <label style="display:flex;align-items:center;gap:8px">
+            Глубина, дней:
+            <input type="number" id="sync-days" value="90" min="1" max="3650" style="width:96px;padding:8px 11px;border:1px solid var(--navy-line);border-radius:4px">
+          </label>
+          <button class="btn primary" id="b-imap">Синхронизировать</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <p class="panel-title">Куда уходят тексты</p>
+        <p style="margin:0">Разбор идёт через API выбранного провайдера — тексты писем покидают
+           машину. На этапе отбора медицинской переписки отправляются только отправитель, тема
+           и даты; тела писем уходят лишь для отобранных цепочек. У Gemini выставлен
+           <code>store: false</code>, поэтому интеракции на их стороне не сохраняются.
+           Отправка писем не подключена: агент готовит черновики, но ничего не шлёт.</p>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<!-- Прогресс долгой операции -->
+<div class="scrim" id="scrim" hidden>
+  <div class="job">
+    <div class="job-head" id="job-title">Работаю…</div>
+    <div class="job-body">
+      <div class="bar"><span id="job-bar"></span></div>
+      <div class="job-log" id="job-log"></div>
+    </div>
+    <div class="job-foot"><button class="btn ghost" id="job-close" hidden>Закрыть</button></div>
+  </div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<script src="app.js"></script>
+</body>
+</html>
