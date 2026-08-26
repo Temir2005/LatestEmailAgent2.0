@@ -22,12 +22,14 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.120.0",
     "mailparser": "^3.7.4",
-    "node-imap": "^0.9.6"
+    "node-imap": "^0.9.6",
+    "nodemailer": "^9.0.5"
   },
   "devDependencies": {
     "@types/bun": "^1.2.21",
     "@types/mailparser": "^3.4.6",
     "@types/node-imap": "^0.9.3",
+    "@types/nodemailer": "^8.0.1",
     "typescript": "^5.9.2"
   }
 }

@@ -118,12 +118,24 @@
       <div id="threads-table"></div>
     </section>
 
+    <!-- ─── Цепочка целиком ──────────────────────────────────────────── -->
+    <section class="view" id="v-thread" hidden>
+      <div class="view-head">
+        <div>
+          <button class="btn ghost small" id="b-thread-back">← Все цепочки</button>
+          <h2 id="thread-subject" style="margin-top:10px">—</h2>
+          <p id="thread-meta"></p>
+        </div>
+      </div>
+      <div id="thread-body"></div>
+    </section>
+
     <!-- ─── Чат ──────────────────────────────────────────────────────── -->
     <section class="view" id="v-chat" hidden>
       <div class="view-head">
         <div>
           <h2 id="chat-title">Чат по всей переписке</h2>
-          <p id="chat-sub">Агент видит сводки всех дел. Для деталей конкретного дела откройте его карточку.</p>
+          <p id="chat-sub">Здесь можно спрашивать о переписке, искать письма, добавлять их в дела и готовить письма к отправке.</p>
         </div>
         <div class="actions">
           <button class="btn ghost small" id="b-chat-clear">Очистить</button>
@@ -131,7 +143,7 @@
       </div>
       <div class="chat-log" id="chat-log"></div>
       <form class="chat-form" id="chat-form">
-        <textarea id="chat-input" placeholder="Спросите про переписку… (Enter — отправить, Shift+Enter — новая строка)"></textarea>
+        <textarea id="chat-input" placeholder="Например: «покажи последнее письмо от Иванова» или «напиши письмо на…»"></textarea>
         <button class="btn primary" type="submit">Отправить</button>
       </form>
     </section>
@@ -174,7 +186,7 @@
            машину. На этапе отбора медицинской переписки отправляются только отправитель, тема
            и даты; тела писем уходят лишь для отобранных цепочек. У Gemini выставлен
            <code>store: false</code>, поэтому интеракции на их стороне не сохраняются.
-           Отправка писем не подключена: агент готовит черновики, но ничего не шлёт.</p>
+          Отправка из чата выполняется через SMTP только после отдельного подтверждения.</p>
       </div>
     </section>
 

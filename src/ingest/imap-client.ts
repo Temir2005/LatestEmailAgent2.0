@@ -20,13 +20,37 @@
 
 import Imap from "node-imap";
 import { simpleParser } from "mailparser";
+import { createRequire } from "node:module";
 import { getImapCredentials, type ImapCredentials } from "../auth/client.ts";
 import { parseEmail, type ParsedEmail } from "./parse.ts";
+
+// utf7@1.0.2 объявляет функции внутри if-блока. Bun 1.3 справедливо не
+// выпускает их из block scope, из-за чего node-imap падает при LIST папок.
+// Подменяем только декодер modified UTF-7, не патча node_modules.
+const imapUtf7 = createRequire(import.meta.url)("utf7").imap as {
+  decode: (value: string) => string;
+  encode: (value: string) => string;
+};
+imapUtf7.encode = (value: string): string =>
+  value.replace(/&/g, "&-").replace(/[^\x20-\x7e]+/g, (chunk) => {
+    const bytes = Buffer.alloc(chunk.length * 2);
+    for (let i = 0; i < chunk.length; i++) bytes.writeUInt16BE(chunk.charCodeAt(i), i * 2);
+    return `&${bytes.toString("base64").replace(/\//g, ",").replace(/=+$/, "")}-`;
+  });
+imapUtf7.decode = (value: string): string =>
+  value.replace(/&([^-]*)-/g, (_match, chunk: string) => {
+    if (!chunk) return "&";
+    const base64 = chunk.replace(/,/g, "/").padEnd(Math.ceil(chunk.length / 4) * 4, "=");
+    const bytes = Buffer.from(base64, "base64");
+    let decoded = "";
+    for (let i = 0; i + 1 < bytes.length; i += 2) decoded += String.fromCharCode(bytes.readUInt16BE(i));
+    return decoded;
+  });
 
 /** Донорский лимит: письмо крупнее просто не тянем в память. */
 const MAX_MESSAGE_BYTES = 50 * 1024 * 1024;
 /** Донорский размер пакета — выборка идёт параллельно, по пачкам. */
-const BATCH_SIZE = 30;
+const BATCH_SIZE = 300;
 
 export interface FolderState {
   uidValidity: number;
@@ -131,6 +155,29 @@ export class ImapClient {
     });
   }
 
+  /** Gmail локализует «Вся почта», поэтому ищем её по IMAP-атрибуту \All. */
+  allMailFolder(): Promise<string | null> {
+    return new Promise((resolve, reject) => {
+      this.imap.getBoxes((err, boxes) => {
+        if (err) return reject(new Error(`Не удалось получить список папок: ${err.message}`));
+
+        const walk = (tree: Imap.MailBoxes, prefix = ""): string | null => {
+          for (const [name, folder] of Object.entries(tree)) {
+            const full = prefix ? `${prefix}${folder.delimiter}${name}` : name;
+            if (folder.attribs.some((a) => a.toLowerCase() === "\\all")) return full;
+            if (folder.children) {
+              const found = walk(folder.children, full);
+              if (found) return found;
+            }
+          }
+          return null;
+        };
+
+        resolve(walk(boxes));
+      });
+    });
+  }
+
   /** UID писем по критериям IMAP-поиска. */
   search(criteria: unknown[]): Promise<number[]> {
     return new Promise((resolve, reject) => {
@@ -145,21 +192,75 @@ export class ImapClient {
    * Забирает письма пачками, параллельно внутри пачки.
    * Одно битое письмо не должно валить весь синк — оно просто пропускается.
    */
-  async fetchByUids(uids: number[], folder: string): Promise<ParsedEmail[]> {
+  async fetchByUids(
+    uids: number[],
+    folder: string,
+    onBatch?: (batch: ParsedEmail[], done: number, total: number) => Promise<void>,
+  ): Promise<ParsedEmail[]> {
     const out: ParsedEmail[] = [];
 
     for (let i = 0; i < uids.length; i += BATCH_SIZE) {
       const batch = uids.slice(i, i + BATCH_SIZE);
-      const results = await Promise.allSettled(batch.map((uid) => this.fetchOne(uid, folder)));
-      for (const result of results) {
-        if (result.status === "fulfilled" && result.value) out.push(result.value);
-        else if (result.status === "rejected") {
-          console.error(`  ! письмо пропущено: ${(result.reason as Error).message}`);
-        }
-      }
+      // Одна IMAP FETCH-команда на пачку. Тридцать отдельных команд через
+      // одно соединение фактически выполнялись последовательно и делали
+      // годовой архив многочасовой операцией.
+      const parsedBatch = await this.fetchBatch(batch, folder);
+      if (!onBatch) out.push(...parsedBatch);
+      if (onBatch) await onBatch(parsedBatch, Math.min(i + batch.length, uids.length), uids.length);
     }
 
     return out;
+  }
+
+  private fetchBatch(uids: number[], folder: string): Promise<ParsedEmail[]> {
+    return new Promise((resolve, reject) => {
+      const fetch = this.imap.fetch(uids, { bodies: "", struct: true });
+      const pending: Array<Promise<ParsedEmail | null>> = [];
+
+      fetch.on("message", (msg) => {
+        pending.push(new Promise((resolveMessage, rejectMessage) => {
+          let attrs: { uid?: number; flags?: string[]; size?: number } = {};
+          const chunks: Buffer[] = [];
+          let size = 0;
+          let tooLarge = false;
+
+          msg.on("attributes", (a) => {
+            attrs = { uid: a.uid, flags: a.flags, size: a.size };
+          });
+          msg.on("body", (stream) => {
+            stream.on("data", (chunk: Buffer) => {
+              size += chunk.length;
+              if (size > MAX_MESSAGE_BYTES) tooLarge = true;
+              else chunks.push(chunk);
+            });
+          });
+          msg.once("end", () => {
+            if (tooLarge) return resolveMessage(null);
+            simpleParser(Buffer.concat(chunks))
+              .then((parsed) => resolveMessage(parseEmail(parsed, {
+                folder,
+                imapUid: attrs.uid,
+                flags: attrs.flags ?? [],
+                sizeBytes: attrs.size ?? size,
+                selfAddress: this.creds.address,
+              })))
+              .catch(rejectMessage);
+          });
+        }));
+      });
+
+      fetch.once("error", reject);
+      fetch.once("end", () => {
+        Promise.allSettled(pending).then((results) => {
+          const parsed: ParsedEmail[] = [];
+          for (const result of results) {
+            if (result.status === "fulfilled" && result.value) parsed.push(result.value);
+            else if (result.status === "rejected") console.error(`  ! письмо пропущено: ${result.reason.message}`);
+          }
+          resolve(parsed);
+        }, reject);
+      });
+    });
   }
 
   private fetchOne(uid: number, folder: string): Promise<ParsedEmail | null> {

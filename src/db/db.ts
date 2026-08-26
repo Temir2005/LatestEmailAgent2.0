@@ -305,6 +305,22 @@ export class ClinicDB {
     return rows.map(toEmail);
   }
 
+  /** Поиск из чата: фильтры можно сочетать, результат всегда от новых к старым. */
+  async findEmails(query: string, sender: string, limit = 10): Promise<EmailRecord[]> {
+    const rows = await this.sql`
+      SELECT * FROM emails
+       WHERE (${sender} = '' AND ${query} = '')
+          OR (${sender} <> '' AND (
+               from_address ILIKE ${`%${sender}%`}
+               OR coalesce(from_name, '') ILIKE ${`%${sender}%`}))
+          OR (${query} <> '' AND (
+               fts @@ plainto_tsquery('russian', ${query})
+               OR coalesce(subject, '') ILIKE ${`%${query}%`}))
+       ORDER BY date_sent DESC
+       LIMIT ${limit}`;
+    return rows.map(toEmail);
+  }
+
   // ─── Технические цепочки ─────────────────────────────────────────────────
 
   /**
@@ -426,6 +442,19 @@ export class ClinicDB {
     return row ? (row.case_id as number) : null;
   }
 
+  async addEmailToCase(emailId: number, caseId: number): Promise<void> {
+    const [email] = await this.sql`SELECT thread_id FROM emails WHERE id = ${emailId}`;
+    if (!email) throw new Error(`Письмо #${emailId} не найдено`);
+    if (email.thread_id == null) throw new Error(`Письмо #${emailId} ещё не входит в техническую цепочку`);
+    const [item] = await this.sql`SELECT id FROM cases WHERE id = ${caseId}`;
+    if (!item) throw new Error(`Дело #${caseId} не найдено`);
+    await this.sql`
+      INSERT INTO case_threads (case_id, thread_id)
+      VALUES (${caseId}, ${email.thread_id as number})
+      ON CONFLICT DO NOTHING`;
+    await this.sql`UPDATE cases SET updated_at = now() WHERE id = ${caseId}`;
+  }
+
   // ─── Дела ────────────────────────────────────────────────────────────────
 
   /**
@@ -475,6 +504,31 @@ export class ClinicDB {
   async getCaseById(id: number): Promise<Case | null> {
     const [row] = await this.sql`SELECT * FROM cases WHERE id = ${id}`;
     return row ? toCase(row) : null;
+  }
+
+  /** Создаёт дело без LLM — для явной команды пользователя из поиска. */
+  async createCaseWithThreads(
+    data: Omit<Case, "id">,
+    threadIds: number[],
+  ): Promise<number> {
+    return this.sql.begin(async (tx) => {
+      const [row] = await tx`
+        INSERT INTO cases (clinic_name, clinic_domain, topic, status, awaiting,
+                           next_step, deadline, summary, key_facts, confidence, provider)
+        VALUES (${data.clinic_name ?? null}, ${data.clinic_domain ?? null},
+                ${data.topic}, ${data.status}, ${data.awaiting ?? null},
+                ${data.next_step ?? null}, ${data.deadline ?? null},
+                ${data.summary ?? null}, ${data.key_facts ?? "[]"},
+                ${data.confidence}, ${data.provider ?? null})
+        RETURNING id`;
+      const id = row.id as number;
+      if (threadIds.length > 0) {
+        await tx`INSERT INTO case_threads ${tx(
+          [...new Set(threadIds)].map((thread_id) => ({ case_id: id, thread_id })),
+        )} ON CONFLICT DO NOTHING`;
+      }
+      return id;
+    });
   }
 
   async getCaseThreads(caseId: number): Promise<Thread[]> {

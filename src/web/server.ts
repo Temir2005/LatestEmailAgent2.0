@@ -25,8 +25,10 @@ import { selectMedicalThreads } from "../llm/triage.ts";
 import { recordAnswer } from "../llm/clarify.ts";
 import { draftReply } from "../llm/draft.ts";
 import { getLLM, type Msg } from "../llm/index.ts";
-import { chatSystemPrompt, renderThread } from "../llm/prompts.ts";
-import type { Case, Clarification, EmailRecord } from "../types.ts";
+import { chatActionSystemPrompt, renderThread } from "../llm/prompts.ts";
+import { CHAT_ACTION_SCHEMA } from "../llm/schemas.ts";
+import { sendEmail, type OutgoingEmail } from "../email/smtp.ts";
+import type { Attachment, Case, Clarification, EmailRecord, Recipient } from "../types.ts";
 
 const PUBLIC_DIR = join(import.meta.dir, "public");
 const cfg = loadConfig();
@@ -34,9 +36,11 @@ const db = await ClinicDB.open(cfg.databaseUrl);
 
 /** Свой адрес: из IMAP-учётки, если она настроена, иначе демо-адрес. */
 let selfAddress = DEMO_USER_ADDRESS;
+let imapConfigured = false;
 try {
   const { getImapCredentials } = await import("../auth/client.ts");
   selfAddress = (await getImapCredentials()).address;
+  imapConfigured = true;
 } catch {
   // IMAP не настроен — работаем на демо-корпусе, это штатный режим.
 }
@@ -47,6 +51,17 @@ try {
  * строго по одному.
  */
 let busy: string | null = null;
+
+interface ChatAction extends OutgoingEmail {
+  action: "answer" | "search" | "add_to_case" | "compose";
+  answer: string;
+  query: string;
+  sender: string;
+  email_id: number;
+  case_id: number;
+}
+
+const pendingSends = new Map<string, { message: OutgoingEmail; expires: number }>();
 
 // ─── Вспомогательное ────────────────────────────────────────────────────────
 
@@ -74,6 +89,34 @@ function threadingHeaders(email: EmailRecord) {
     message_id: email.message_id,
     in_reply_to: email.in_reply_to ?? null,
     references: (email.email_references ?? "").split(/\s+/).filter(Boolean),
+  };
+}
+
+/** Карточка письма для JSON-ответа: получатели и вложения уже подтянуты пачкой. */
+function emailView(
+  email: EmailRecord,
+  recipientsBy: Map<number, Recipient[]>,
+  attachmentsBy: Map<number, Attachment[]>,
+) {
+  return {
+    id: email.id,
+    from_address: email.from_address,
+    from_name: email.from_name,
+    to: (recipientsBy.get(email.id!) ?? []).map((r) => ({
+      kind: r.kind,
+      address: r.address,
+      name: r.name,
+    })),
+    date_sent: email.date_sent,
+    subject: email.subject,
+    body_text: email.body_text ?? "",
+    is_sent: Boolean(email.is_sent),
+    has_attachments: Boolean(email.has_attachments),
+    attachments: (attachmentsBy.get(email.id!) ?? []).map((a) => ({
+      filename: a.filename,
+      size_bytes: a.size_bytes,
+    })),
+    headers: threadingHeaders(email),
   };
 }
 
@@ -207,7 +250,7 @@ async function syncTask(emit: Emit, source: string, days: number): Promise<void>
   if (source === "imap") {
     emit("step", { text: `Подключаюсь к ящику, беру письма за ${days} дн…`, progress: 0.1 });
     const { syncImap } = await import("../ingest/imap-sync.ts");
-    const result = await syncImap(db, { days });
+    const result = await syncImap(db, { days, history: true });
     emit("step", { text: `Загружено новых: ${result.loaded}, пропущено: ${result.skipped}`, progress: 0.8 });
     const rebuilt = await rebuildThreads(db);
     emit("done", {
@@ -302,27 +345,6 @@ async function api(req: Request, url: URL): Promise<Response> {
       db.getAttachmentsFor(ids),
     ]);
 
-    const emailView = (email: EmailRecord) => ({
-      id: email.id,
-      from_address: email.from_address,
-      from_name: email.from_name,
-      to: (recipientsBy.get(email.id!) ?? []).map((r) => ({
-        kind: r.kind,
-        address: r.address,
-        name: r.name,
-      })),
-      date_sent: email.date_sent,
-      subject: email.subject,
-      body_text: email.body_text ?? "",
-      is_sent: Boolean(email.is_sent),
-      has_attachments: Boolean(email.has_attachments),
-      attachments: (attachmentsBy.get(email.id!) ?? []).map((a) => ({
-        filename: a.filename,
-        size_bytes: a.size_bytes,
-      })),
-      headers: threadingHeaders(email),
-    });
-
     const clarifications = await db.getCaseClarifications(id);
 
     return json({
@@ -333,7 +355,7 @@ async function api(req: Request, url: URL): Promise<Response> {
         link_method: t.link_method,
         message_count: t.message_count,
         root_message_id: t.root_message_id,
-        emails: (emailsByThread.get(t.id!) ?? []).map(emailView),
+        emails: (emailsByThread.get(t.id!) ?? []).map((e) => emailView(e, recipientsBy, attachmentsBy)),
       })),
       clarifications: clarifications.map((q) => ({
         ...clarificationView(q, c.topic),
@@ -341,6 +363,33 @@ async function api(req: Request, url: URL): Promise<Response> {
         answer: q.answer,
       })),
       drafts: await db.getCaseDrafts(id),
+    });
+  }
+
+  // — цепочка целиком, вне зависимости от того, привязана ли она к делу —
+  const threadMatch = path.match(/^\/threads\/(\d+)$/);
+  if (threadMatch && method === "GET") {
+    const id = Number(threadMatch[1]);
+    const thread = await db.getThreadById(id);
+    if (!thread) return fail(`Цепочки #${id} нет`, 404);
+
+    const emails = await db.getThreadEmails(id);
+    const ids = emails.map((e) => e.id!);
+    const [recipientsBy, attachmentsBy] = await Promise.all([
+      db.getRecipientsFor(ids),
+      db.getAttachmentsFor(ids),
+    ]);
+
+    return json({
+      thread: {
+        id: thread.id,
+        subject: thread.subject,
+        link_method: thread.link_method,
+        message_count: thread.message_count,
+        root_message_id: thread.root_message_id,
+      },
+      case_id: await db.caseIdForThread(id),
+      emails: emails.map((e) => emailView(e, recipientsBy, attachmentsBy)),
     });
   }
 
@@ -402,6 +451,16 @@ async function api(req: Request, url: URL): Promise<Response> {
     return json({ cleared: true });
   }
 
+  if (path === "/chat/send" && method === "POST") {
+    const body = (await req.json().catch(() => ({}))) as { token?: string };
+    const pending = body.token ? pendingSends.get(body.token) : null;
+    if (!pending || pending.expires < Date.now()) return fail("Подтверждение устарело. Составьте письмо заново.", 410);
+    // Одноразовый токен удаляем до внешнего вызова: двойной клик не отправит два письма.
+    pendingSends.delete(body.token!);
+    const messageId = await sendEmail(pending.message);
+    return json({ sent: true, messageId });
+  }
+
   if (path === "/chat" && method === "POST") {
     const body = (await req.json().catch(() => ({}))) as { message?: string; caseId?: number | null };
     const text = body.message?.trim();
@@ -445,13 +504,79 @@ async function api(req: Request, url: URL): Promise<Response> {
       ...history.map((m) => ({ role: m.role, content: m.content })),
     ];
 
-    const answer = await llm.complete<string>({
-      system: chatSystemPrompt(await db.getUserFacts(), await db.getAnsweredClarifications()),
+    const action = await llm.complete<ChatAction>({
+      system: chatActionSystemPrompt(await db.getUserFacts(), await db.getAnsweredClarifications()),
       messages,
+      schema: CHAT_ACTION_SCHEMA,
     });
 
+    let answer = action.answer.trim();
+    let responseAction: Record<string, unknown> | null = null;
+
+    if (action.action === "search") {
+      const latestOnly = /последн|сам(?:ое|ый|ую)\s+нов|latest|newest/iu.test(text);
+      let found = await db.findEmails(action.query.trim(), action.sender.trim(), latestOnly ? 1 : 5);
+      if (found.length === 0) {
+        const { syncImapSearch } = await import("../ingest/imap-sync.ts");
+        const pulled = await syncImapSearch(db, {
+          query: action.query.trim() || action.sender.trim(),
+          sender: action.sender,
+          limit: latestOnly ? 1 : 20,
+        });
+        if (pulled.loaded > 0) await rebuildThreads(db);
+        found = await db.findEmails(action.query.trim(), action.sender.trim(), latestOnly ? 1 : 5);
+      }
+      answer = found.length === 0
+        ? "Писем по этому запросу не найдено. Уточните имя, адрес отправителя или слова из темы."
+        : found.map((email, index) => {
+            const body = (email.body_text ?? email.snippet ?? "").trim();
+            const clipped = body.length > 1800 ? `${body.slice(0, 1800)}\n[…текст обрезан…]` : body;
+            return `${index === 0 ? "Последнее найденное" : "Найдено"} письмо #${email.id}\nДата: ${email.date_sent}\nОт: ${email.from_name ?? email.from_address} <${email.from_address}>\nТема: ${email.subject ?? "(без темы)"}\n\n${clipped}`;
+          }).join("\n\n──────────\n\n");
+    } else if (action.action === "add_to_case") {
+      const targetCase = action.case_id || caseId || 0;
+      if (!action.email_id) answer = "Не понял, какое письмо добавить. Сначала найдите его — в результате будет номер «Письмо #…».";
+      else if (targetCase) {
+        await db.addEmailToCase(action.email_id, targetCase);
+        answer = `Письмо #${action.email_id} и его техническая цепочка добавлены в дело #${targetCase}.`;
+      } else {
+        const email = await db.getEmailById(action.email_id);
+        if (!email) answer = `Письмо #${action.email_id} не найдено.`;
+        else if (!email.thread_id) answer = `Письмо #${action.email_id} ещё не входит в техническую цепочку.`;
+        else {
+          const existing = await db.caseIdForThread(email.thread_id);
+          if (existing) answer = `Письмо #${action.email_id} уже находится в деле #${existing}.`;
+          else {
+            const domain = email.from_address.split("@")[1] ?? null;
+            const created = await db.createCaseWithThreads({
+              clinic_name: email.from_name ?? null,
+              clinic_domain: domain,
+              topic: email.subject ?? `Письмо #${action.email_id}`,
+              status: "open",
+              summary: `Дело создано по явной просьбе пользователя из письма #${action.email_id}.`,
+              confidence: 1,
+              provider: "local",
+            }, [email.thread_id]);
+            answer = `Письмо #${action.email_id} добавлено в новое дело #${created}.`;
+          }
+        }
+      }
+    } else if (action.action === "compose") {
+      if (!action.to.trim() || !action.to.includes("@") || !action.subject.trim() || !action.body.trim()) {
+        answer = "Для отправки нужны получатель, тема и текст. Укажите недостающие данные — адрес я угадывать не буду.";
+      } else {
+        const token = crypto.randomUUID();
+        const message = { to: action.to.trim(), subject: action.subject.trim(), body: action.body.trim() };
+        pendingSends.set(token, { message, expires: Date.now() + 15 * 60_000 });
+        answer = `Письмо подготовлено, но ещё не отправлено.\n\nКому: ${message.to}\nТема: ${message.subject}\n\n${message.body}`;
+        responseAction = { type: "confirm_send", token, ...message };
+      }
+    }
+
+    if (!answer) answer = "Не удалось сформировать ответ. Переформулируйте запрос.";
+
     await db.appendChatMessage({ case_id: caseId, role: "assistant", content: answer });
-    return json({ answer, provider: llm.name });
+    return json({ answer, provider: llm.name, action: responseAction });
   }
 
   // — долгие задачи —
@@ -546,3 +671,51 @@ console.log(`  провайдер: ${cfg.provider} (${cfg.models[cfg.provider]})
 console.log(`  база: ${cfg.databaseUrl.replace(/:\/\/[^@]*@/, "://***@")}`);
 console.log(`  демон дозагрузки: ${watcher.status}`);
 console.log(`  писем: ${stats.emails}, цепочек: ${stats.threads}, дел: ${stats.cases}\n`);
+
+/**
+ * Чтобы почта подгружалась сама, а не по кнопке «Синхронизировать», веб
+ * поднимает демон дозагрузки (`ingest/watcher.ts`) как дочерний процесс —
+ * отдельно запускать `bun run watch` не нужно.
+ *
+ * Если демон уже где-то работает (отдельный `bun run watch` или контейнер
+ * `worker`) — судим об этом по свежести пульса в базе, той же логике, что и
+ * индикатор в углу интерфейса, — второй экземпляр не поднимаем: два
+ * параллельных IMAP-соединения не запрещены, но не нужны. Отключить встроенный
+ * демон явно можно переменной `EMBED_WATCHER=0` (так и сделано для `web` в
+ * docker-compose — там дозагрузку уже держит сервис `worker`).
+ */
+let watcherChild: ReturnType<typeof Bun.spawn> | null = null;
+let stoppingServer = false;
+
+async function startEmbeddedWatcher(): Promise<void> {
+  if (!imapConfigured) return; // демо-режим — подгружать нечего
+  if (process.env.EMBED_WATCHER === "0") return;
+
+  const silentMs = watcher.lastBeatAt ? Date.now() - new Date(watcher.lastBeatAt).getTime() : Infinity;
+  if (watcher.status !== "stopped" && silentMs < 120_000) {
+    console.log(`  демон дозагрузки уже работает отдельно — встроенный не поднимаю\n`);
+    return;
+  }
+
+  console.log(`  поднимаю встроенный демон дозагрузки…`);
+  watcherChild = Bun.spawn(["bun", "run", join(import.meta.dir, "..", "ingest", "watcher.ts")], {
+    stdout: "inherit",
+    stderr: "inherit",
+    stdin: "ignore",
+  });
+
+  watcherChild.exited.then((code) => {
+    if (!stoppingServer) console.log(`  ! встроенный демон дозагрузки завершился (код ${code})`);
+  });
+}
+
+await startEmbeddedWatcher();
+
+function shutdown(signal: string): void {
+  stoppingServer = true;
+  watcherChild?.kill();
+  process.exit(0);
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));

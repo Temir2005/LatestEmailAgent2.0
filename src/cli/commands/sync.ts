@@ -27,7 +27,7 @@ export async function runSync(db: ClinicDB, options: SyncOptions): Promise<void>
     if (result.failed > 0) console.log(`  ${yellow("!")} не разобрано: ${result.failed}`);
   } else if (options.imap) {
     const { syncImap } = await import("../../ingest/imap-sync.ts");
-    const result = await syncImap(db, { days: options.days });
+    const result = await syncImap(db, { days: options.days, history: true });
     loaded = result.loaded;
     console.log(`  ${green("✓")} с IMAP: ${result.loaded} новых, пропущено ${result.skipped}`);
   } else {

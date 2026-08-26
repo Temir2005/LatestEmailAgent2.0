@@ -8,11 +8,13 @@
         "@anthropic-ai/sdk": "^0.120.0",
         "mailparser": "^3.7.4",
         "node-imap": "^0.9.6",
+        "nodemailer": "^9.0.5",
       },
       "devDependencies": {
         "@types/bun": "^1.2.21",
         "@types/mailparser": "^3.4.6",
         "@types/node-imap": "^0.9.3",
+        "@types/nodemailer": "^8.0.1",
         "typescript": "^5.9.2",
       },
     },
@@ -33,6 +35,8 @@
     "@types/node": ["@types/node@26.2.0", "", { "dependencies": { "undici-types": "~8.3.0" } }, "sha512-5IviulTZeRNp2vAJ514cc/HUlY5nZ9fCbq9DMyC52BrhFZACo3nI0R7qBxhQmo/d27NFe96ur/b7Wwxklda+kg=="],
 
     "@types/node-imap": ["@types/node-imap@0.9.3", "", { "dependencies": { "@types/node": "*" } }, "sha512-PIATiaiyk6815QgCm1Obq7M37e23usWvZUKpHBMYVhYfUFPU+R7SXlhirrDHtIKIRRLU2RX0EY/jPYzFsS9r5g=="],
+
+    "@types/nodemailer": ["@types/nodemailer@8.0.1", "", { "dependencies": { "@types/node": "*" } }, "sha512-PxpaInm8V1JQDd4j0ds5HfvWQk8JupS1C0Picb96QJsrrRDjBH+DlK7L4ZdNSqNULhiZRQHc40nLVShaGxXAMw=="],
 
     "@zone-eu/mailsplit": ["@zone-eu/mailsplit@5.4.15", "", { "dependencies": { "libbase64": "1.3.0", "libmime": "5.4.2", "libqp": "2.1.1" } }, "sha512-c7ZpxauvF4AEkDJlKDYO7iMUtMuqJMBnDWNff1cyx+d7zaBVR3iFEmXhNHOVoMmVyVF3pTZLsLIJsEFKDldOAA=="],
 

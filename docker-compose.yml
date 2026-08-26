@@ -47,8 +47,12 @@ services:
     <<: *app
     # ENTRYPOINT образа ведёт в роутер CLI — для сервера подменяем его.
     entrypoint: ["bun", "run", "src/web/server.ts"]
+    environment:
+      CLINIC_DATABASE_URL: postgres://clinic:clinic@db:5432/clinic
+      # Дозагрузку уже держит сервис worker — второй демон внутри web не нужен.
+      EMBED_WATCHER: "0"
     ports:
-      - "${WEB_PORT:-3000}:3000"
+      - "${WEB_PORT:-3001}:${PORT:-3001}"
     restart: unless-stopped
 
   agent:

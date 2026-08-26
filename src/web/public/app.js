@@ -388,15 +388,32 @@ async function renderThreads() {
     : `<table class="grid">
         <thead><tr><th>Тема</th><th>Связь</th><th>Писем</th><th>Период</th><th>Дело</th></tr></thead>
         <tbody>${threads.map((t) => `
-          <tr>
+          <tr class="row-link" onclick="location.hash='#/thread/${t.id}'">
             <td>${esc(t.subject || "(без темы)")}<div class="mono">${esc(t.root_message_id)}</div></td>
             <td><span class="pill ${t.link_method}">${LINK[t.link_method]}</span></td>
             <td>${t.message_count}</td>
             <td>${fmtDay(t.first_date)} — ${fmtDay(t.last_date)}</td>
-            <td>${t.case_id ? `<a href="#/case/${t.case_id}">№${t.case_id}</a>` : "—"}</td>
+            <td>${t.case_id ? `<a href="#/case/${t.case_id}" onclick="event.stopPropagation()">№${t.case_id}</a>` : "—"}</td>
           </tr>`).join("")}</tbody>
       </table>`;
 }
+
+// ─── Цепочка целиком ────────────────────────────────────────────────────────
+
+async function renderThread(id) {
+  const data = await api(`/threads/${id}`);
+  const t = data.thread;
+
+  $("thread-subject").textContent = t.subject || "(без темы)";
+  $("thread-meta").innerHTML =
+    `<span class="pill ${t.link_method}">${LINK[t.link_method]}</span> ` +
+    `писем: ${t.message_count}` +
+    (data.case_id ? ` · <a href="#/case/${data.case_id}">к делу №${data.case_id}</a>` : " · в дело пока не входит");
+
+  $("thread-body").innerHTML = data.emails.map(mailCard).join("");
+}
+
+$("b-thread-back").onclick = () => { location.hash = "#/threads"; };
 
 // ─── Чат ────────────────────────────────────────────────────────────────────
 
@@ -408,8 +425,8 @@ async function renderChat(caseId) {
 
   $("chat-title").textContent = c ? `Чат по делу №${c.id}` : "Чат по всей переписке";
   $("chat-sub").textContent = c
-    ? `${c.topic} — агент видит всю переписку этого дела целиком.`
-    : "Агент видит сводки всех дел. Для деталей конкретного дела откройте его карточку.";
+    ? `${c.topic} — агент видит переписку дела, умеет искать, добавлять письма и готовить отправку.`
+    : "Ищите письма по имени, адресу или тексту, добавляйте их в дела и готовьте новые письма к отправке.";
 
   const { messages } = await api(`/chat${caseId ? `?case=${caseId}` : ""}`);
   paintChat(messages);
@@ -418,7 +435,7 @@ async function renderChat(caseId) {
 function paintChat(messages) {
   const log = $("chat-log");
   log.innerHTML = messages.length === 0
-    ? `<p style="color:var(--muted);margin:0">Спросите что угодно: «что от меня ждут», «когда приём», «есть ли неоплаченные счета».</p>`
+    ? `<p style="color:var(--muted);margin:0">Примеры: «покажи последнее письмо от Анны», «найди письмо про анализ крови», «добавь письмо #42 в дело 3», «напиши письмо на name@example.com».</p>`
     : messages.map((m) => `<div class="bubble ${m.role}">${esc(m.content)}</div>`).join("");
   log.scrollTop = log.scrollHeight;
 }
@@ -441,11 +458,28 @@ $("chat-form").onsubmit = async (e) => {
       method: "POST",
       body: JSON.stringify({ message: text, caseId: chatCase ? Number(chatCase) : null }),
     });
-    $("typing").outerHTML = `<div class="bubble assistant">${esc(r.answer)}</div>`;
+    $("typing").outerHTML = `<div class="bubble assistant">${esc(r.answer)}${r.action?.type === "confirm_send"
+      ? `<div class="send-confirm"><button class="btn primary small" data-send-token="${esc(r.action.token)}">Подтвердить отправку</button><span>Письмо не уйдёт без нажатия</span></div>`
+      : ""}</div>`;
   } catch (err) {
     $("typing").outerHTML = `<div class="bubble assistant" style="color:var(--stop)">${esc(err.message)}</div>`;
   }
   log.scrollTop = log.scrollHeight;
+};
+
+$("chat-log").onclick = async (e) => {
+  const button = e.target.closest("[data-send-token]");
+  if (!button) return;
+  await withBusy(button, async () => {
+    const result = await api("/chat/send", {
+      method: "POST",
+      body: JSON.stringify({ token: button.dataset.sendToken }),
+    });
+    if (result.sent) {
+      button.closest(".send-confirm").innerHTML = "<b>Письмо отправлено</b>";
+      toast("Письмо отправлено");
+    }
+  });
 };
 
 $("chat-input").onkeydown = (e) => {
@@ -516,7 +550,7 @@ setInterval(pulse, 15_000);
 
 // ─── Роутинг ────────────────────────────────────────────────────────────────
 
-const VIEWS = ["cases", "case", "clarify", "threads", "chat", "sources"];
+const VIEWS = ["cases", "case", "clarify", "threads", "thread", "chat", "sources"];
 
 async function route() {
   const [name = "cases", arg] = location.hash.replace(/^#\/?/, "").split("/");
@@ -526,7 +560,7 @@ async function route() {
 
   for (const v of VIEWS) $(`v-${v}`).hidden = v !== view;
 
-  const navName = view === "case" ? "cases" : view;
+  const navName = view === "case" ? "cases" : view === "thread" ? "threads" : view;
   for (const b of document.querySelectorAll(".nav-item")) {
     b.classList.toggle("on", b.dataset.route === navName);
   }
@@ -536,6 +570,7 @@ async function route() {
     if (view === "case")    await renderCase(arg);
     if (view === "clarify") await renderClarify();
     if (view === "threads") await renderThreads();
+    if (view === "thread")  await renderThread(arg);
     if (view === "chat")    await renderChat(arg || null);
   } catch (err) {
     toast(err.message, true);
