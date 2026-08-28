@@ -11,12 +11,29 @@ import { getLLM } from "./index.ts";
 import { DRAFT_SCHEMA } from "./schemas.ts";
 import { draftSystemPrompt, renderThread } from "./prompts.ts";
 import { parseReferences } from "../threading/normalize.ts";
-import type { EmailRecord } from "../types.ts";
+import type { AnswerType, EmailRecord } from "../types.ts";
 
 interface DraftResponse {
   subject: string;
   body: string;
   uses_facts: string[];
+  clarifications: Array<{
+    question: string;
+    why_needed: string;
+    answer_type: AnswerType;
+    options: string[];
+  }>;
+}
+
+/**
+ * Модели не хватило данных на полный ответ. Вместо письма с пропуском в
+ * тексте в базу лёг вопрос — вызывающая сторона (автопилот или ручная
+ * кнопка) должна остановиться и не отправлять ничего.
+ */
+export class NeedsClarificationError extends Error {
+  constructor(readonly count: number) {
+    super(`Не хватает данных для ответа — добавлено вопросов: ${count}`);
+  }
 }
 
 export interface DraftResult {
@@ -64,7 +81,7 @@ export async function draftReply(
     .join("\n\n");
 
   const result = await llm.complete<DraftResponse>({
-    system: draftSystemPrompt(await db.getUserFacts()),
+    system: draftSystemPrompt(await db.getUserFacts(), await db.getAnsweredClarifications()),
     messages: [
       {
         role: "user",
@@ -79,6 +96,28 @@ export async function draftReply(
     ],
     schema: DRAFT_SCHEMA,
   });
+
+  // Чего не хватило — вопрос пользователю на будущее, чтобы следующий ответ
+  // был точнее. Отправку он НЕ блокирует: переписку агент ведёт сам, а
+  // неизвестное спрашивает у клиники прямо в письме.
+  for (const q of result.clarifications ?? []) {
+    await db.insertClarification({
+      case_id: caseId,
+      question: q.question,
+      why_needed: q.why_needed,
+      answer_type: q.answer_type,
+      options: q.options?.length ? JSON.stringify(q.options) : null,
+      status: "pending",
+      provider: llm.name,
+    });
+  }
+
+  // Единственное, что отправить нельзя, — пустоту. Схема это запрещает,
+  // но провайдер может вернуть пустую строку, и молча слать пустое письмо
+  // клинике хуже, чем не слать ничего.
+  if (!result.body.trim()) {
+    throw new NeedsClarificationError((result.clarifications ?? []).length);
+  }
 
   // Заголовки собираем сами: References — путь предыдущего письма плюс оно само.
   const references = [...parseReferences(target.email_references), target.message_id];

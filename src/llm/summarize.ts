@@ -38,8 +38,14 @@ export async function summarizeCases(
   db: ClinicDB,
   selfAddress: string,
   onProgress?: (topic: string, index: number, total: number) => void,
+  /**
+   * Пересводить только дела с новой перепиской. Сводка стоит один запрос к
+   * провайдеру на дело, и на бесплатном тарифе полный пересчёт всех дел
+   * выжирает дневную квоту за один заход автопилота.
+   */
+  onlyChanged = false,
 ): Promise<SummarizeResult> {
-  const cases = await db.getCases();
+  const cases = onlyChanged ? await db.casesNeedingSummary() : await db.getCases();
   if (cases.length === 0) return { summarized: 0, clarifications: 0, provider: "—" };
 
   const llm = await getLLM();

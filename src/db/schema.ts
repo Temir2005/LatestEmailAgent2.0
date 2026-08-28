@@ -192,8 +192,19 @@ CREATE TABLE IF NOT EXISTS drafts (
   subject          TEXT NOT NULL,
   body             TEXT NOT NULL,
   provider         TEXT,
+  -- Автопилот отвечает клиникам сам, без клика «Подтвердить отправку»:
+  -- sent_at/auto отличают такой ответ от черновика, ждущего человека.
+  sent_at          TIMESTAMPTZ,
+  auto             BOOLEAN NOT NULL DEFAULT FALSE,
+  sent_message_id  TEXT,
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Столбцы добавлены после первого релиза черновиков — ALTER, а не пересоздание
+-- таблицы, чтобы не терять то, что уже накопилось.
+ALTER TABLE drafts ADD COLUMN IF NOT EXISTS sent_at TIMESTAMPTZ;
+ALTER TABLE drafts ADD COLUMN IF NOT EXISTS auto BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE drafts ADD COLUMN IF NOT EXISTS sent_message_id TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_drafts_case ON drafts (case_id);
 
@@ -207,6 +218,35 @@ CREATE TABLE IF NOT EXISTS sync_state (
   last_uid     BIGINT NOT NULL DEFAULT 0,
   last_sync_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Вердикт отбора: относится ли цепочка к медицине.
+--
+-- Ключ — root_message_id, а не thread_id: цепочки пересобираются с нуля при
+-- каждом ребилде (см. replaceThreads), суррогатный id их не переживает.
+--
+-- Без этой таблицы отбор гонялся бы по всему ящику при каждом новом письме.
+-- На бесплатном тарифе провайдера это десятки запросов на ровном месте:
+-- немедицинская цепочка в дело не попадает и потому вечно выглядит новой.
+CREATE TABLE IF NOT EXISTS triage_verdicts (
+  root_message_id TEXT PRIMARY KEY,
+  is_medical      BOOLEAN NOT NULL,
+  decided_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Замок на разбор переписки. Разбор идёт в двух процессах — веб по кнопке
+-- «Разобрать заново» и автопилот в демоне, — а replaceCases сносит все дела
+-- целиком: два одновременных прогона затёрли бы друг друга.
+--
+-- Аренда, а не голый флаг: процесс может умереть, не сняв замок, и тогда
+-- разбор не запустился бы уже никогда. Просроченная аренда считается свободной.
+CREATE TABLE IF NOT EXISTS analysis_lock (
+  id         INTEGER PRIMARY KEY CHECK (id = 1),
+  holder     TEXT,
+  taken_at   TIMESTAMPTZ,
+  expires_at TIMESTAMPTZ
+);
+
+INSERT INTO analysis_lock (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
 
 -- Журнал демона: видно, жив ли он и когда в последний раз что-то принёс.
 CREATE TABLE IF NOT EXISTS watcher_state (

@@ -162,6 +162,10 @@ export interface Draft {
   subject: string;
   body: string;
   provider?: string | null;
+  /** Отправлено ли уже — автопилотом, без ручного подтверждения. */
+  sent_at?: string | null;
+  auto?: boolean;
+  sent_message_id?: string | null;
   created_at?: string;
 }
 

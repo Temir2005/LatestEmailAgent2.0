@@ -16,8 +16,11 @@
  * писем поднял бы union-find двадцать раз подряд. Вместо этого приходы
  * копятся и схлопываются в одну пересборку.
  *
- * Дела демон НЕ трогает: разбор стоит денег и вызывается человеком. Новые
- * письма попадают в цепочки, а веб покажет, что переписка изменилась.
+ * После пересборки цепочек демон зовёт автопилот (`agent/autopilot.ts`):
+ * тот разбирает переписку по делам и сам отвечает клиникам, где очередь
+ * отвечать за нами — без ручной кнопки и без подтверждения на отправку.
+ * Отключается переменной `AUTOPILOT=0`, если нужно оставить только
+ * дозагрузку писем без автономных ответов.
  */
 
 import { loadConfig } from "../config.ts";
@@ -25,12 +28,19 @@ import { ClinicDB } from "../db/db.ts";
 import { ImapClient } from "./imap-client.ts";
 import { syncFolder } from "./imap-sync.ts";
 import { rebuildThreads } from "./sync.ts";
+import { runAutopilot } from "../agent/autopilot.ts";
 
 const FOLDER = process.env.WATCH_FOLDER ?? "INBOX";
 /** Глубина первичной загрузки, если база пустая. */
 const INITIAL_DAYS = Number(process.env.WATCH_INITIAL_DAYS ?? "90") || 90;
-/** Страховочный опрос: IDLE молча умирает, это единственная защита. */
-const POLL_MS = (Number(process.env.WATCH_POLL_SECONDS ?? "300") || 300) * 1000;
+/**
+ * Страховочный опрос: IDLE молча умирает за NAT, это единственная защита.
+ *
+ * Десять секунд, а не пять минут: почта должна появляться сама, а не когда
+ * повезёт. Опрос — это UID SEARCH по одной папке, для сервера он дешёвый;
+ * дорогой разбор запускается только когда письма реально пришли.
+ */
+const POLL_MS = (Number(process.env.WATCH_POLL_SECONDS ?? "10") || 10) * 1000;
 /** Сколько ждать после события, собирая пачку, прежде чем пересобирать. */
 const DEBOUNCE_MS = 4000;
 /** Отметка «жив» в базе — по ней веб понимает, работает ли демон. */
@@ -101,6 +111,8 @@ async function pull(reason: string): Promise<void> {
     }
 
     await db.setWatcherStatus("watching", `последнее письмо: ${new Date().toISOString()}`);
+
+    await runAutopilotSafely(client.imap.address, reason);
   } catch (err) {
     log(`! догон не удался: ${(err as Error).message}`);
     await db.setWatcherStatus("error", (err as Error).message);
@@ -110,6 +122,26 @@ async function pull(reason: string): Promise<void> {
       pullAgain = false;
       schedulePull("догон вдогонку");
     }
+  }
+}
+
+/**
+ * Автопилот, который не может уронить демон.
+ *
+ * Разбор ходит в LLM, а тот падает по причинам, к почте отношения не
+ * имеющим: перегрузка провайдера, кончившаяся квота, таймаут. Пробрасывать
+ * такую ошибку наверх нельзя — вызывающий код решит, что порвалось
+ * соединение с ящиком, и начнёт переподключаться по кругу.
+ */
+async function runAutopilotSafely(selfAddress: string, reason: string): Promise<void> {
+  try {
+    const auto = await runAutopilot(db, selfAddress, (m) => log(`автопилот: ${m}`));
+    log(
+      `автопилот (${reason}): дел ${auto.cases}, отправлено ${auto.sent}, ` +
+        `пропущено ${auto.skipped}, ошибок ${auto.errors}`,
+    );
+  } catch (err) {
+    log(`! автопилот (${reason}) не отработал: ${(err as Error).message}`);
   }
 }
 
@@ -124,15 +156,24 @@ async function connect(): Promise<void> {
   client = { imap };
 
   // Первым делом — забрать всё, что пришло, пока демона не было.
-  await syncFolder(db, imap, FOLDER, INITIAL_DAYS, (m) => log(`! ${m}`)).then(async (result) => {
-    if (result.loaded > 0) {
-      const rebuilt = await rebuildThreads(db);
-      await db.recordWatcherMail(result.loaded);
-      log(`догон при старте: +${result.loaded} писем, цепочек ${rebuilt.threads}`);
-    } else {
-      log(`догон при старте: нового нет`);
-    }
-  });
+  const caught = await syncFolder(db, imap, FOLDER, INITIAL_DAYS, (m) => log(`! ${m}`));
+  if (caught.loaded > 0) {
+    const rebuilt = await rebuildThreads(db);
+    await db.recordWatcherMail(caught.loaded);
+    log(`догон при старте: +${caught.loaded} писем, цепочек ${rebuilt.threads}`);
+  } else {
+    log(`догон при старте: нового нет`);
+  }
+
+  // Автопилот на старте гоняем в любом случае, даже когда нового не пришло:
+  // письмо могло прийти, пока демон лежал, и остаться без ответа. Иначе оно
+  // провисит до следующего входящего.
+  //
+  // Ошибку глушим намеренно: связь с ящиком не должна зависеть от того, жив
+  // ли провайдер LLM. Без этого перегруженный Gemini роняет connect(), тот
+  // уходит в переподключение — и демон крутится в горячем цикле, дёргая
+  // IMAP и API по кругу.
+  await runAutopilotSafely(imap.address, "старт");
 
   imap.watch((count) => {
     log(`сервер сообщил о новых письмах: ${count}`);

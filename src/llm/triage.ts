@@ -88,6 +88,12 @@ export async function selectMedicalThreads(
 
   const medical = threads.filter((t) => chosen.has(t.root_message_id));
 
+  // Вердикт запоминаем по каждой просмотренной цепочке, включая отсеянные:
+  // иначе отбор гонялся бы по всему ящику заново при каждом новом письме.
+  await db.saveTriageVerdicts(
+    threads.map((t) => ({ root: t.root_message_id, isMedical: chosen.has(t.root_message_id) })),
+  );
+
   return {
     medical,
     skipped: threads.length - medical.length,

@@ -436,6 +436,62 @@ export class ClinicDB {
     return map;
   }
 
+  /**
+   * Цепочки, которые отбор ещё не смотрел.
+   *
+   * Именно они, а не «цепочки без дела»: немедицинская переписка в дело не
+   * попадает никогда и потому вечно выглядела бы новой, гоняя дорогой разбор
+   * по всему ящику на каждое письмо.
+   */
+  async threadsNeedingTriage(): Promise<Thread[]> {
+    const rows = await this.sql`
+      SELECT t.* FROM threads t
+       WHERE NOT EXISTS (
+         SELECT 1 FROM triage_verdicts v WHERE v.root_message_id = t.root_message_id
+       )
+       ORDER BY t.last_date DESC`;
+    return rows.map(toThread);
+  }
+
+  /** Запоминает вердикт отбора, чтобы второй раз за него не платить. */
+  async saveTriageVerdicts(verdicts: Array<{ root: string; isMedical: boolean }>): Promise<void> {
+    if (verdicts.length === 0) return;
+    await this.sql`
+      INSERT INTO triage_verdicts ${this.sql(
+        verdicts.map((v) => ({ root_message_id: v.root, is_medical: v.isMedical })),
+      )}
+      ON CONFLICT (root_message_id) DO UPDATE SET
+        is_medical = EXCLUDED.is_medical, decided_at = now()`;
+  }
+
+  /** Цепочки, признанные медицинскими, — вход для классификации по делам. */
+  async medicalThreads(): Promise<Thread[]> {
+    const rows = await this.sql`
+      SELECT t.* FROM threads t
+       JOIN triage_verdicts v ON v.root_message_id = t.root_message_id
+       WHERE v.is_medical
+       ORDER BY t.last_date DESC`;
+    return rows.map(toThread);
+  }
+
+  /**
+   * Дела, в которых есть письма свежее последнего пересчёта сводки.
+   * Пересводить остальные — впустую жечь квоту: переписка в них не менялась.
+   */
+  async casesNeedingSummary(): Promise<Case[]> {
+    const rows = await this.sql`
+      SELECT c.* FROM cases c
+       WHERE c.summary IS NULL
+          OR EXISTS (
+            SELECT 1
+              FROM case_threads ct
+              JOIN emails e ON e.thread_id = ct.thread_id
+             WHERE ct.case_id = c.id AND e.date_sent > c.updated_at
+          )
+       ORDER BY c.id ASC`;
+    return rows.map(toCase);
+  }
+
   async caseIdForThread(threadId: number): Promise<number | null> {
     const [row] = await this
       .sql`SELECT case_id FROM case_threads WHERE thread_id = ${threadId} LIMIT 1`;
@@ -466,6 +522,12 @@ export class ClinicDB {
     items: Array<{ data: Omit<Case, "id">; threadIds: number[] }>,
   ): Promise<number[]> {
     return this.sql.begin(async (tx) => {
+      // Отвечённые вопросы переживают пересборку дел. Они висят на cases
+      // через ON DELETE CASCADE, а дела здесь сносятся целиком — без этого
+      // отрыва ответы пользователя исчезали бы при каждом разборе, и агент
+      // спрашивал бы одно и то же бесконечно, так и не дойдя до ответа клинике.
+      await tx`UPDATE clarifications SET case_id = NULL WHERE status = 'answered'`;
+
       await tx`DELETE FROM cases`;
       // Иначе нумерация продолжится с #6, #11 — пользователь наберёт
       // «дело 1» и не найдёт ничего.
@@ -715,8 +777,16 @@ export class ClinicDB {
     return rows.map((r: Record<string, unknown>) => ({
       ...(r as unknown as Draft),
       references: (r.email_references as string) ?? null,
+      sent_at: isoOrNull(r.sent_at),
       created_at: isoOrNull(r.created_at) ?? undefined,
     }));
+  }
+
+  /** Черновик отправлен автопилотом, без ручного подтверждения. */
+  async markDraftSent(id: number, messageId: string): Promise<void> {
+    await this.sql`
+      UPDATE drafts SET sent_at = now(), auto = TRUE, sent_message_id = ${messageId}
+       WHERE id = ${id}`;
   }
 
   // ─── Синхронизация ───────────────────────────────────────────────────────
@@ -735,6 +805,39 @@ export class ClinicDB {
         uid_validity = EXCLUDED.uid_validity,
         last_uid     = EXCLUDED.last_uid,
         last_sync_at = EXCLUDED.last_sync_at`;
+  }
+
+  // ─── Замок на разбор ─────────────────────────────────────────────────────
+
+  /**
+   * Берёт замок на разбор переписки, если он свободен. Разбор идёт в двух
+   * процессах (веб по кнопке и автопилот в демоне), а `replaceCases` сносит
+   * все дела разом — одновременный запуск затёр бы результат.
+   *
+   * Аренда с истечением: процесс может умереть, не сняв замок, и вечный
+   * флаг заблокировал бы разбор навсегда.
+   */
+  async acquireAnalysisLock(holder: string, leaseMinutes = 30): Promise<boolean> {
+    const [row] = await this.sql`
+      UPDATE analysis_lock
+         SET holder = ${holder}, taken_at = now(),
+             expires_at = now() + ${`${leaseMinutes} minutes`}::interval
+       WHERE id = 1 AND (holder IS NULL OR expires_at < now())
+      RETURNING holder`;
+    return Boolean(row);
+  }
+
+  async releaseAnalysisLock(): Promise<void> {
+    await this.sql`
+      UPDATE analysis_lock SET holder = NULL, taken_at = NULL, expires_at = NULL
+       WHERE id = 1`;
+  }
+
+  /** Кто сейчас держит замок, если держит. */
+  async analysisLockHolder(): Promise<string | null> {
+    const [row] = await this
+      .sql`SELECT holder FROM analysis_lock WHERE id = 1 AND expires_at > now()`;
+    return (row?.holder as string) ?? null;
   }
 
   // ─── Состояние демона ────────────────────────────────────────────────────

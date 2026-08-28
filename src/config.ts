@@ -23,7 +23,12 @@ const DEFAULTS: Config = {
   provider: "gemini",
   models: {
     // gemini-2.5-* выключают 16.10.2026 — не использовать.
-    gemini: "gemini-3.7-flash",
+    //
+    // flash-lite, а не flash: на бесплатном тарифе у gemini-3.7-flash квота
+    // 20 запросов в сутки, и один заход автопилота выбирает её целиком —
+    // агент замолкает до следующего дня. У flash-lite лимит рабочий.
+    // Модель переопределяется переменной GEMINI_MODEL.
+    gemini: "gemini-flash-lite-latest",
     anthropic: "claude-opus-5",
   },
   confidenceThreshold: 0.6,
@@ -48,6 +53,10 @@ export function loadConfig(): Config {
   }
 
   const envProvider = process.env.LLM_PROVIDER as ProviderName | undefined;
+  // Квоты бесплатного тарифа привязаны к модели: когда одна выгорает,
+  // сменить её нужно без пересборки образа.
+  const envGeminiModel = process.env.GEMINI_MODEL?.trim();
+  const envAnthropicModel = process.env.ANTHROPIC_MODEL?.trim();
   // Именно CLINIC_DATABASE_URL, а не общепринятая DATABASE_URL: последняя
   // часто экспортирована глобально в профиле оболочки под совсем другой
   // проект, и агент молча писал бы медицинскую переписку в чужую базу.
@@ -56,7 +65,12 @@ export function loadConfig(): Config {
   cached = {
     ...DEFAULTS,
     ...fromFile,
-    models: { ...DEFAULTS.models, ...(fromFile.models ?? {}) },
+    models: {
+      ...DEFAULTS.models,
+      ...(fromFile.models ?? {}),
+      ...(envGeminiModel ? { gemini: envGeminiModel } : {}),
+      ...(envAnthropicModel ? { anthropic: envAnthropicModel } : {}),
+    },
     ...(envProvider ? { provider: envProvider } : {}),
     ...(envDbUrl ? { databaseUrl: envDbUrl } : {}),
   };

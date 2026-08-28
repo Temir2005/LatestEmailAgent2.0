@@ -23,7 +23,7 @@ import { classifyCases } from "../llm/classify.ts";
 import { summarizeCases } from "../llm/summarize.ts";
 import { selectMedicalThreads } from "../llm/triage.ts";
 import { recordAnswer } from "../llm/clarify.ts";
-import { draftReply } from "../llm/draft.ts";
+import { draftReply, NeedsClarificationError } from "../llm/draft.ts";
 import { getLLM, type Msg } from "../llm/index.ts";
 import { chatActionSystemPrompt, renderThread } from "../llm/prompts.ts";
 import { CHAT_ACTION_SCHEMA } from "../llm/schemas.ts";
@@ -140,7 +140,13 @@ type Emit = (event: string, data: unknown) => void;
  * Оборачивает долгую задачу в поток событий. Ошибка тоже уходит событием —
  * иначе на фронте останется бесконечный спиннер без объяснения.
  */
-function sseResponse(name: string, task: (emit: Emit) => Promise<void>): Response {
+function sseResponse(
+  name: string,
+  task: (emit: Emit) => Promise<void>,
+  /** Разбор трогает все дела разом — его нельзя вести одновременно с
+   *  автопилотом в демоне, а тот живёт в другом процессе. */
+  exclusive = false,
+): Response {
   if (busy) return fail(`Уже идёт: ${busy}. Дождитесь окончания.`, 409);
   busy = name;
 
@@ -151,11 +157,22 @@ function sseResponse(name: string, task: (emit: Emit) => Promise<void>): Respons
         controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
       };
 
+      let locked = false;
       try {
+        if (exclusive) {
+          locked = await db.acquireAnalysisLock("веб");
+          if (!locked) {
+            emit("failed", {
+              message: `Разбор уже идёт: ${(await db.analysisLockHolder()) ?? "другой процесс"}. Дождитесь окончания.`,
+            });
+            return;
+          }
+        }
         await task(emit);
       } catch (err) {
         emit("failed", { message: (err as Error).message });
       } finally {
+        if (locked) await db.releaseAnalysisLock();
         busy = null;
         controller.close();
       }
@@ -251,8 +268,21 @@ async function syncTask(emit: Emit, source: string, days: number): Promise<void>
     emit("step", { text: `Подключаюсь к ящику, беру письма за ${days} дн…`, progress: 0.1 });
     const { syncImap } = await import("../ingest/imap-sync.ts");
     const result = await syncImap(db, { days, history: true });
-    emit("step", { text: `Загружено новых: ${result.loaded}, пропущено: ${result.skipped}`, progress: 0.8 });
+    emit("step", { text: `Загружено новых: ${result.loaded}, пропущено: ${result.skipped}`, progress: 0.6 });
     const rebuilt = await rebuildThreads(db);
+
+    // Ручная загрузка обязана вести себя как приход писем демоном: иначе
+    // нажатие «Синхронизировать» приносит письма, а агент их не смотрит.
+    if (result.loaded > 0) {
+      emit("step", { text: "Разбираю и отвечаю клиникам…", progress: 0.8 });
+      const { runAutopilot } = await import("../agent/autopilot.ts");
+      const auto = await runAutopilot(db, selfAddress, (m) => emit("step", { text: m, progress: 0.9 }));
+      emit("step", {
+        text: `Автопилот: отправлено ${auto.sent}, ошибок ${auto.errors}`,
+        progress: 0.95,
+      });
+    }
+
     emit("done", {
       loaded: result.loaded,
       threads: rebuilt.threads,
@@ -397,8 +427,15 @@ async function api(req: Request, url: URL): Promise<Response> {
   const draftMatch = path.match(/^\/cases\/(\d+)\/draft$/);
   if (draftMatch && method === "POST") {
     const body = (await req.json().catch(() => ({}))) as { instruction?: string };
-    const result = await draftReply(db, Number(draftMatch[1]), selfAddress, body.instruction);
-    return json(result);
+    try {
+      const result = await draftReply(db, Number(draftMatch[1]), selfAddress, body.instruction);
+      return json(result);
+    } catch (err) {
+      if (err instanceof NeedsClarificationError) {
+        return fail(`Не хватает данных для ответа — вопрос добавлен на вкладку «Вопросы агента».`, 409);
+      }
+      throw err;
+    }
   }
 
   // — допрос —
@@ -581,7 +618,7 @@ async function api(req: Request, url: URL): Promise<Response> {
 
   // — долгие задачи —
   if (path === "/analyze" && method === "GET") {
-    return sseResponse("разбор переписки", analyzeTask);
+    return sseResponse("разбор переписки", analyzeTask, true);
   }
 
   if (path === "/sync" && method === "GET") {

@@ -17,9 +17,28 @@
 
 import { getSecret } from "../auth/client.ts";
 import { adaptSchema } from "./schemas.ts";
-import { LLMError, type CompleteRequest, type LLM } from "./index.ts";
+import { LLMError, withRetry, type CompleteRequest, type LLM } from "./index.ts";
 
 const ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/interactions";
+
+/**
+ * Минимальный зазор между запросами.
+ *
+ * Бесплатный тариф считает запросы в минуту, а разбор идёт пачкой: сводка
+ * по каждому делу — отдельный запрос. Без зазора пачка выбивает лимит
+ * целиком, и дальше всё упирается в ретраи. Дешевле подождать заранее.
+ */
+const MIN_GAP_MS = Number(process.env.GEMINI_MIN_GAP_MS ?? "3500") || 3500;
+
+/** Очередь на один процесс: запросы идут по одному, с паузой между ними. */
+let gate: Promise<void> = Promise.resolve();
+
+function throttle(): Promise<void> {
+  const wait = gate.then(() => new Promise<void>((resolve) => setTimeout(resolve, MIN_GAP_MS)));
+  // В цепочку кладём проглоченную версию: одна ошибка не должна заклинить очередь.
+  gate = wait.catch(() => {});
+  return wait;
+}
 
 interface TextPart {
   type: string;
@@ -123,7 +142,24 @@ export class GeminiLLM implements LLM {
     return body;
   }
 
-  private async post(body: Record<string, unknown>): Promise<Interaction> {
+  /**
+   * Запрос с повтором при перегрузке.
+   *
+   * Бесплатный тариф Gemini регулярно отвечает «high demand» — без повтора
+   * это роняло весь заход автопилота, и письмо клинике просто не уходило.
+   * Ошибки запроса (неверный ключ, кривая схема) не повторяем: сами они не
+   * починятся, а повтор только съест квоту.
+   */
+  private post(body: Record<string, unknown>): Promise<Interaction> {
+    return withRetry(() => this.postOnce(body), {
+      onRetry: (attempt, delay, message) =>
+        console.log(`  ! Gemini занят (попытка ${attempt}), жду ${Math.round(delay / 1000)} с: ${message.slice(0, 120)}`),
+    });
+  }
+
+  private async postOnce(body: Record<string, unknown>): Promise<Interaction> {
+    await throttle();
+
     const res = await fetch(ENDPOINT, {
       method: "POST",
       headers: { "x-goog-api-key": this.apiKey, "content-type": "application/json" },

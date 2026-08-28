@@ -262,3 +262,21 @@ export async function seedDemo(db: ClinicDB): Promise<{ emails: number }> {
 
 /** Адрес пользователя в демо-корпусе — нужен командам, чтобы отличать «нас». */
 export const DEMO_USER_ADDRESS = ME;
+
+/**
+ * Домены тест-фикстуры. Демо-корпус часто лежит в одной базе с живой почтой,
+ * а автопилот отправляет письма по-настоящему — без этого списка он слал бы
+ * их на выдуманные адреса от имени выдуманного «Иванова Петра».
+ */
+export const DEMO_DOMAINS = [
+  "example.com",
+  "zdorovie-clinic.ru",
+  "labtest-med.ru",
+  "med-partner.ru",
+  "mail-service.ru",
+] as const;
+
+export const isDemoAddress = (address: string): boolean => {
+  const domain = address.toLowerCase().split("@")[1] ?? "";
+  return DEMO_DOMAINS.some((d) => domain === d);
+};

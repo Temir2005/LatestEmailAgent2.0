@@ -284,7 +284,13 @@ async function renderCase(id) {
 
     ${data.drafts.length ? `
       <div class="card">
-        <p class="panel-title">Черновик ответа <span style="text-transform:none;letter-spacing:0;font-weight:400">— не отправлен, отправка не подключена</span></p>
+        <p class="panel-title">${data.drafts[0].sent_at ? "Ответ агента" : "Черновик ответа"}
+          <span style="text-transform:none;letter-spacing:0;font-weight:400">
+            — ${data.drafts[0].sent_at
+              ? `отправлено автопилотом ${fmtDate(data.drafts[0].sent_at)}`
+              : "не отправлен, ждёт вашего решения"}
+          </span>
+        </p>
         <dl class="kv" style="margin-bottom:12px">
           <dt>Кому</dt><dd>${esc(data.drafts[0].to_address)}</dd>
           <dt>Тема</dt><dd>${esc(data.drafts[0].subject)}</dd>
@@ -546,7 +552,7 @@ async function pulse() {
   }
 }
 
-setInterval(pulse, 15_000);
+setInterval(pulse, 10_000);
 
 // ─── Роутинг ────────────────────────────────────────────────────────────────
 

@@ -5,6 +5,9 @@ export interface OutgoingEmail {
   to: string;
   subject: string;
   body: string;
+  /** Заголовки ответа на существующую цепочку — RFC 5322 In-Reply-To/References. */
+  inReplyTo?: string;
+  references?: string;
 }
 
 export async function sendEmail(message: OutgoingEmail): Promise<string> {
@@ -22,6 +25,8 @@ export async function sendEmail(message: OutgoingEmail): Promise<string> {
     to: message.to,
     subject: message.subject,
     text: message.body,
+    inReplyTo: message.inReplyTo,
+    references: message.references,
   });
   return result.messageId;
 }
