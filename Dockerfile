@@ -13,6 +13,10 @@ COPY scripts ./scripts
 COPY auth-service ./auth-service
 COPY tsconfig.json ./
 
+# Регламент переписки: агент сверяет с ним каждое входящее письмо и решает,
+# отвечать самому или передать человеку. Без него автопилот не запускается.
+COPY rag_clinic_agent_v2.md ./
+
 # Данные лежат в PostgreSQL (том pgdata), внутри контейнера состояния нет.
 # Адрес базы приходит из docker-compose переменной CLINIC_DATABASE_URL.
 

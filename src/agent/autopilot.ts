@@ -27,7 +27,8 @@ import { rebuildThreads } from "../ingest/sync.ts";
 import { selectMedicalThreads } from "../llm/triage.ts";
 import { classifyCases } from "../llm/classify.ts";
 import { summarizeCases } from "../llm/summarize.ts";
-import { draftReply, NeedsClarificationError } from "../llm/draft.ts";
+import { NeedsClarificationError } from "../llm/draft.ts";
+import { decideReply, formatDateTime, sentTooRecently } from "./decide.ts";
 import { sendEmail } from "../email/smtp.ts";
 import { normalizeSubject } from "../threading/normalize.ts";
 import { isDemoAddress } from "../ingest/seed.ts";
@@ -111,28 +112,113 @@ export async function runAutopilot(
       const emails = await db.getCaseEmails(c.id!);
       if (!needsReply(emails)) continue;
 
+      // §9: после отказа переписку не продолжаем. Проверяем до вызова модели —
+      // и чтобы не потратить запрос, и чтобы запрет нельзя было обойти её
+      // решением.
+      const newest = emails[emails.length - 1]!;
+      if (await db.isContactBanned(newest.from_address)) {
+        skipped++;
+        log(`дело #${c.id} «${c.topic}»: ${newest.from_address} просил не писать — молчу`);
+        continue;
+      }
+
       // Открытые вопросы к пользователю отправку НЕ блокируют: агент ведёт
       // переписку сам, а недостающее спрашивает у клиники прямо в письме.
       // Иначе любой висящий вопрос замораживал бы дело навсегда.
       try {
-        const draft = await draftReply(db, c.id!, selfAddress);
+        // §9: не больше одного письма в сутки в один тред.
+        if (sentTooRecently(emails)) {
+          skipped++;
+          log(`дело #${c.id} «${c.topic}»: письмо в этот тред уже уходило за последние сутки`);
+          continue;
+        }
+
+        const decision = await decideReply(db, c.id!, selfAddress);
+
+        // §6: красный флаг — клинике по существу не отвечаем, зовём человека.
+        if (decision.action === "escalate") {
+          skipped++;
+          await db.insertClarification({
+            case_id: c.id!,
+            question: `Клиника пишет о том, что агенту трогать нельзя (${decision.redFlags.join(", ")}). Ответьте сами.`,
+            why_needed: `Регламент §6 запрещает агенту отвечать по существу: ${decision.reasons.join("; ") || decision.redFlags.join(", ")}`,
+            answer_type: "text",
+            status: "pending",
+            provider: decision.provider,
+          });
+          log(`дело #${c.id} «${c.topic}»: ${decision.redFlags.join(", ")} — передаю человеку`);
+          continue;
+        }
+
+        // §4: отказ от переписки — закрываем и больше не пишем.
+        if (decision.action === "close") {
+          skipped++;
+          await db.banContact(decision.to, "клиника попросила не писать");
+          await db.updateCaseStatus(c.id!, "closed");
+          log(`дело #${c.id} «${c.topic}»: отказ от переписки — закрыл и больше не пишу`);
+          continue;
+        }
+
+        if (!decision.send) {
+          skipped++;
+          log(`дело #${c.id} «${c.topic}»: письмо не сформировано (${decision.reasons.join("; ")})`);
+          continue;
+        }
 
         // Демо-корпус лежит в одной базе с живой почтой. Письмо на выдуманный
         // домен в лучшем случае отбивается, в худшем уходит чужому человеку —
         // и подписано оно будет «Ивановым Петром» из фикстуры, а не вами.
-        if (isDemoAddress(draft.to)) {
+        if (isDemoAddress(decision.to)) {
           skipped++;
-          log(`дело #${c.id} «${c.topic}»: адрес ${draft.to} из демо-корпуса — не отправляю`);
+          log(`дело #${c.id} «${c.topic}»: адрес ${decision.to} из демо-корпуса — не отправляю`);
           continue;
         }
 
         // Проверка перед включением в бою: показывает, что было бы отправлено,
         // не касаясь настоящего ящика клиники.
         if (process.env.AUTOPILOT_DRY_RUN === "1") {
-          log(`[сухой прогон] дело #${c.id} «${c.topic}» → ${draft.to}: «${draft.subject}»\n${draft.body}`);
+          log(
+            `[сухой прогон] дело #${c.id} «${c.topic}» → ${decision.to} [${decision.action}]` +
+              `${decision.reasons.length ? ` (${decision.reasons.join("; ")})` : ""}: ` +
+              `«${decision.subject}»\n${decision.body}`,
+          );
           sent++;
           continue;
         }
+
+        // §9: подтверждение уходит только после того, как запись реально
+        // прошла. Сначала календарь, потом письмо — не наоборот.
+        if (decision.action === "book" && decision.booking) {
+          await db.bookMeeting({
+            case_id: c.id!,
+            clinic_name: c.clinic_name ?? null,
+            contact: null,
+            topic: decision.booking.topic,
+            starts_at: decision.booking.startsAt,
+            ends_at: decision.booking.endsAt,
+            format: null,
+            location: null,
+            owner: selfAddress,
+          });
+          log(`дело #${c.id}: встреча записана на ${formatDateTime(decision.booking.startsAt)}`);
+        }
+
+        const draft = {
+          id: await db.insertDraft({
+            case_id: c.id!,
+            in_reply_to: decision.inReplyTo,
+            references: decision.references,
+            to_address: decision.to,
+            subject: decision.subject,
+            body: decision.body,
+            provider: decision.provider,
+          }),
+          to: decision.to,
+          subject: decision.subject,
+          body: decision.body,
+          inReplyTo: decision.inReplyTo,
+          references: decision.references,
+        };
 
         const messageId = await sendEmail({
           to: draft.to,
@@ -159,7 +245,10 @@ export async function runAutopilot(
         }, [{ kind: "to", address: draft.to, name: null }]);
 
         sent++;
-        log(`дело #${c.id} «${c.topic}»: автоответ отправлен ${draft.to}`);
+        log(
+          `дело #${c.id} «${c.topic}»: [${decision.action}] отправлено ${draft.to}` +
+            `${decision.reasons.length ? ` (${decision.reasons.join("; ")})` : ""}`,
+        );
       } catch (err) {
         if (err instanceof NeedsClarificationError) {
           skipped++;

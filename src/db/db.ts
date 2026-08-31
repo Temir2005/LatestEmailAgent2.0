@@ -807,6 +807,71 @@ export class ClinicDB {
         last_sync_at = EXCLUDED.last_sync_at`;
   }
 
+  // ─── Календарь и запреты (регламент) ─────────────────────────────────────
+
+  /**
+   * Занят ли слот у ответственного, с буфером §5 по обе стороны.
+   * Регламент требует этой проверки до брони: подтвердить встречу поверх
+   * уже назначенной значит подвести обе стороны.
+   */
+  async hasMeetingConflict(
+    owner: string,
+    startsAt: Date,
+    endsAt: Date,
+    bufferMinutes = 0,
+  ): Promise<boolean> {
+    const pad = `${bufferMinutes} minutes`;
+    const [row] = await this.sql`
+      SELECT 1 FROM meetings
+       WHERE owner = ${owner}
+         AND status = 'booked'
+         AND starts_at < ${endsAt}::timestamptz + ${pad}::interval
+         AND ends_at   > ${startsAt}::timestamptz - ${pad}::interval
+       LIMIT 1`;
+    return Boolean(row);
+  }
+
+  /**
+   * Записывает встречу. Подтверждение клинике отправляется только после
+   * успеха этого вызова — §9 запрещает подтверждать несостоявшуюся запись.
+   */
+  async bookMeeting(meeting: {
+    case_id: number | null;
+    clinic_name: string | null;
+    contact: string | null;
+    topic: string;
+    starts_at: Date;
+    ends_at: Date;
+    format: string | null;
+    location: string | null;
+    owner: string;
+  }): Promise<number> {
+    const [row] = await this.sql`
+      INSERT INTO meetings (case_id, clinic_name, contact, topic, starts_at, ends_at,
+                            format, location, owner)
+      VALUES (${meeting.case_id}, ${meeting.clinic_name}, ${meeting.contact}, ${meeting.topic},
+              ${meeting.starts_at}, ${meeting.ends_at}, ${meeting.format}, ${meeting.location},
+              ${meeting.owner})
+      RETURNING id`;
+    return row.id as number;
+  }
+
+  async getMeetings(): Promise<Array<Record<string, unknown>>> {
+    return this.sql`SELECT * FROM meetings WHERE status = 'booked' ORDER BY starts_at ASC`;
+  }
+
+  /** Адресат попросил больше не писать — запрет переживает пересборку дел. */
+  async banContact(address: string, reason: string): Promise<void> {
+    await this.sql`
+      INSERT INTO contact_bans (address, reason) VALUES (${address.toLowerCase()}, ${reason})
+      ON CONFLICT (address) DO NOTHING`;
+  }
+
+  async isContactBanned(address: string): Promise<boolean> {
+    const [row] = await this.sql`SELECT 1 FROM contact_bans WHERE address = ${address.toLowerCase()}`;
+    return Boolean(row);
+  }
+
   // ─── Замок на разбор ─────────────────────────────────────────────────────
 
   /**

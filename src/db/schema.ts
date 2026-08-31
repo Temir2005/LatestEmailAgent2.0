@@ -219,6 +219,42 @@ CREATE TABLE IF NOT EXISTS sync_state (
   last_sync_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- ─── Регламент переписки ──────────────────────────────────────────────────
+
+-- Календарь встреч.
+--
+-- Регламент запрещает отправлять подтверждение, если запись не прошла, и
+-- требует проверять, что у нашего ответственного нет другой встречи в это
+-- время. Без собственного календаря обе проверки выполнить нечем, поэтому
+-- бронь живёт здесь: она же и есть доказательство, что запись состоялась.
+CREATE TABLE IF NOT EXISTS meetings (
+  id          INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  case_id     INTEGER REFERENCES cases(id) ON DELETE SET NULL,
+  clinic_name TEXT,
+  contact     TEXT,
+  topic       TEXT NOT NULL,
+  starts_at   TIMESTAMPTZ NOT NULL,
+  ends_at     TIMESTAMPTZ NOT NULL,
+  format      TEXT,
+  location    TEXT,
+  owner       TEXT NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'booked' CHECK (status IN ('booked','cancelled')),
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_meetings_slot ON meetings (owner, starts_at, ends_at);
+
+-- Кому писать больше нельзя: «не пишите мне», отказ, закрытая переписка.
+--
+-- Ключ — адрес, а не дело: дела пересобираются с нуля при каждом разборе,
+-- и запрет, живущий на деле, исчез бы вместе с ним. Нарушить его — значит
+-- писать человеку, который прямо попросил перестать.
+CREATE TABLE IF NOT EXISTS contact_bans (
+  address    TEXT PRIMARY KEY,
+  reason     TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- Вердикт отбора: относится ли цепочка к медицине.
 --
 -- Ключ — root_message_id, а не thread_id: цепочки пересобираются с нуля при
