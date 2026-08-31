@@ -21,6 +21,7 @@ import {
   DEFAULT_DURATIONS,
   MIN_HOURS_BETWEEN_LETTERS,
   checkSchedule,
+  detectOutOfScope,
   detectRedFlags,
   formatDate,
   formatDateTime,
@@ -120,6 +121,14 @@ export async function decideReply(
   const target = lastIncoming(emails, selfAddress);
   if (!target) throw new Error(`В деле #${caseId} нет входящих писем — отвечать не на что`);
 
+  const incomingText = `${target.subject ?? ""}\n${target.body_text ?? ""}`;
+
+  // Медицина и персональные данные человеку не отдаются (§7): по ним агент
+  // отвечает сам, что это вне его компетенции, и возвращает разговор к
+  // встрече. Раньше они шли в эскалацию наравне с деньгами, и переписка
+  // вставала — пользователь не мог ответить на вопрос о противопоказаниях.
+  const outOfScope = detectOutOfScope(incomingText);
+
   const llm = await getLLM();
   const threads = await db.getCaseThreads(caseId);
   const emailsByThread = await db.getEmailsByThreads(threads.map((t) => t.id!));
@@ -140,7 +149,12 @@ export async function decideReply(
         content:
           `Дело: «${c.topic}»${c.clinic_name ? ` (клиника: ${c.clinic_name})` : ""}\n` +
           (c.summary ? `Сводка: ${c.summary}\n` : "") +
-          `\nОтвечаем на письмо от ${target.from_address}, тема «${target.subject ?? ""}».\n\n` +
+          `\nОтвечаем на письмо от ${target.from_address}, тема «${target.subject ?? ""}».\n` +
+          (outOfScope.length
+            ? `\nВ письме затронуто вне нашей компетенции: ${outOfScope.join(", ")}. ` +
+              `По существу этого не отвечай, скажи, что вопрос не к нам, и вернись к встрече (§7).\n`
+            : "") +
+          `\n` +
           `Переписка:\n\n${correspondence}`,
       },
     ],
@@ -152,17 +166,31 @@ export async function decideReply(
 
   // — §6: красные флаги. Своё суждение добавляем к модельному, а не заменяем:
   //   пропущенный флаг означает письмо клинике про цену или диагноз.
-  const incomingText = `${target.subject ?? ""}\n${target.body_text ?? ""}`;
-  const redFlags = [...new Set([...(result.red_flags ?? []), ...detectRedFlags(incomingText)])];
+  const OUT_OF_SCOPE_WORDS = /медицин|диагноз|симптом|персональн|пациент/i;
+
+  const redFlags = [
+    ...new Set([...(result.red_flags ?? []), ...detectRedFlags(incomingText)]),
+  ].filter((f) => !OUT_OF_SCOPE_WORDS.test(f));
   if (redFlags.length > 0 && action !== "close") {
     if (action !== "escalate") reasons.push(`красный флаг §6: ${redFlags.join(", ")}`);
     action = "escalate";
   }
 
-  // — §4: отказ от переписки закрывает её независимо от мнения модели.
-  if (looksLikeRefusal(incomingText)) {
+  // — §4: отказ от переписки. Закрытие требует явных слов в письме, а не
+  //   только мнения модели.
+  //
+  //   Асимметрия намеренная: ошибочное закрытие уводит агента в вечное
+  //   молчание и заносит адрес в запрет — заметить это можно лишь случайно.
+  //   Ошибочное незакрытие стоит одного лишнего письма. Модель уже принимала
+  //   за отказ раздражённое «бля вернись», после чего живая переписка
+  //   закрывалась навсегда.
+  const refusalWords = looksLikeRefusal(incomingText);
+  if (refusalWords) {
     if (action !== "close") reasons.push("клиника отказалась от переписки");
     action = "close";
+  } else if (action === "close") {
+    reasons.push("модель сочла письмо отказом, но прямых слов об этом нет — продолжаю переписку");
+    action = "clarify";
   }
 
   // — §1 и §3: бронь допускается только после проверок.
@@ -237,19 +265,9 @@ export async function decideReply(
 
   const references = [...parseReferences(target.email_references), target.message_id];
 
-  // Вопросы к своей стороне копим независимо от действия: они делают
-  // следующий ответ точнее и отправку не блокируют.
-  for (const q of result.clarifications ?? []) {
-    await db.insertClarification({
-      case_id: caseId,
-      question: q.question,
-      why_needed: q.why_needed,
-      answer_type: q.answer_type,
-      options: q.options?.length ? JSON.stringify(q.options) : null,
-      status: "pending",
-      provider: llm.name,
-    });
-  }
+  // Вопросов пользователю здесь не заводим: недостающее агент спрашивает
+  // у клиники прямо в письме (action=clarify по §4). К человеку идут только
+  // красные флаги §6 — этим занимается автопилот.
 
   return {
     action,

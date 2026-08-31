@@ -10,6 +10,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   checkSchedule,
+  detectOutOfScope,
   detectRedFlags,
   formatDateTime,
   instantFrom,
@@ -104,17 +105,30 @@ describe("цитаты §1", () => {
   });
 });
 
-describe("красные флаги §6", () => {
-  test("деньги, юристы, медицина и ПДн ловятся", () => {
+describe("что уходит человеку §6", () => {
+  test("деньги, юристы и конфликт — только они", () => {
+    // Критерий §6: пользователь обязан это решить, у клиники не спросишь.
     expect(detectRedFlags("Какая будет цена?")).toContain("вопрос про цену");
     expect(detectRedFlags("Пришлите счёт и реквизиты")).toContain("договор или оплата");
     expect(detectRedFlags("Передаю юристу, будет претензия")).toContain("юридический вопрос");
-    expect(detectRedFlags("Какой диагноз вы ставите?")).toContain("медицинский вопрос по существу");
-    expect(detectRedFlags("ИИН пациента 900101300123")).toContain("персональные данные пациента");
+    expect(detectRedFlags("Мы крайне недовольны")).toContain("жалоба или конфликт");
   });
 
-  test("обычное письмо про запись флагов не поднимает", () => {
-    expect(detectRedFlags("Подтверждаем встречу 14 сентября в 15:00, третий этаж")).toEqual([]);
+  test("медицина и ПДн человеку НЕ уходят — на них агент отвечает сам", () => {
+    // Раньше они шли в эскалацию, и переписка вставала: пользователь не
+    // может ответить клинике про противопоказания. По §7 агент отвечает
+    // сам, что вопрос вне его компетенции.
+    expect(detectRedFlags("Какой диагноз вы ставите?")).toEqual([]);
+    expect(detectRedFlags("ИИН пациента 900101300123")).toEqual([]);
+
+    expect(detectOutOfScope("Какой диагноз вы ставите?")).toContain("медицинский вопрос");
+    expect(detectOutOfScope("ИИН пациента 900101300123")).toContain("персональные данные пациента");
+  });
+
+  test("обычное письмо про запись не поднимает ничего", () => {
+    const text = "Подтверждаем встречу 14 сентября в 15:00, третий этаж";
+    expect(detectRedFlags(text)).toEqual([]);
+    expect(detectOutOfScope(text)).toEqual([]);
   });
 
   test("отказ от переписки распознаётся", () => {

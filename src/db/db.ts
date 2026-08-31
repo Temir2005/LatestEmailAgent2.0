@@ -492,6 +492,21 @@ export class ClinicDB {
     return rows.map(toCase);
   }
 
+  /** Дела всех цепочек разом — список писем не должен бить по базе в цикле. */
+  async caseIdsForThreads(threadIds: number[]): Promise<Map<number, number>> {
+    const map = new Map<number, number>();
+    if (threadIds.length === 0) return map;
+
+    const rows = await this.sql`
+      SELECT thread_id, min(case_id)::int AS case_id
+        FROM case_threads
+       WHERE thread_id IN ${this.sql(threadIds)}
+       GROUP BY thread_id`;
+
+    for (const row of rows) map.set(row.thread_id as number, row.case_id as number);
+    return map;
+  }
+
   async caseIdForThread(threadId: number): Promise<number | null> {
     const [row] = await this
       .sql`SELECT case_id FROM case_threads WHERE thread_id = ${threadId} LIMIT 1`;
@@ -657,7 +672,24 @@ export class ClinicDB {
 
   // ─── Уточнения ───────────────────────────────────────────────────────────
 
+  /**
+   * Заводит вопрос, если такого ещё не задавали.
+   *
+   * Разбор перезапускается на каждое письмо, и модель формулирует один и тот
+   * же вопрос снова и снова — про одно письмо их накапливалось по три штуки
+   * подряд, и они забивали экран, оттесняя саму переписку. Повтором считаем
+   * совпадение текста без учёта регистра и пробелов; уже отвечённый вопрос
+   * повторно тоже не заводим — ответ на него есть.
+   */
   async insertClarification(c: Omit<Clarification, "id">): Promise<number> {
+    const [existing] = await this.sql`
+      SELECT id FROM clarifications
+       WHERE status IN ('pending','answered')
+         AND lower(regexp_replace(question, '\\s+', ' ', 'g'))
+             = lower(regexp_replace(${c.question}, '\\s+', ' ', 'g'))
+       LIMIT 1`;
+    if (existing) return existing.id as number;
+
     const [row] = await this.sql`
       INSERT INTO clarifications (case_id, thread_id, email_id, question, why_needed,
                                   answer_type, options, status, provider)
@@ -805,6 +837,19 @@ export class ClinicDB {
         uid_validity = EXCLUDED.uid_validity,
         last_uid     = EXCLUDED.last_uid,
         last_sync_at = EXCLUDED.last_sync_at`;
+  }
+
+  // ─── Настройки ───────────────────────────────────────────────────────────
+
+  async getSetting(key: string): Promise<string | null> {
+    const [row] = await this.sql`SELECT value FROM settings WHERE key = ${key}`;
+    return row ? (row.value as string) : null;
+  }
+
+  async setSetting(key: string, value: string): Promise<void> {
+    await this.sql`
+      INSERT INTO settings (key, value) VALUES (${key}, ${value})
+      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`;
   }
 
   // ─── Календарь и запреты (регламент) ─────────────────────────────────────

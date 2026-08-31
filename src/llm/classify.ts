@@ -149,18 +149,18 @@ export async function classifyCases(
   // Одна транзакция: частично пересобранных дел не бывает даже при падении.
   await db.replaceCases(items);
 
-  let clarifications = 0;
-  for (const q of result.clarifications ?? []) {
-    await db.insertClarification({
-      question: q.question,
-      why_needed: q.why_needed,
-      answer_type: q.answer_type,
-      options: q.options?.length ? JSON.stringify(q.options) : null,
-      status: "pending",
-      provider: llm.name,
-    });
-    clarifications++;
-  }
+  /**
+   * Вопросы разбора пользователю НЕ задаются.
+   *
+   * Раньше сюда попадало «к какой клинике относится это письмо» — вопрос,
+   * на который пользователь ответить не может: он в клинике не работает и
+   * знает о переписке ровно то, что в ней написано. Недостающее выясняет
+   * агент, и выясняет у клиники — отдельным письмом по §4 регламента.
+   *
+   * В очередь к человеку попадают только красные флаги §6, и заводит их
+   * автопилот, а не разбор.
+   */
+  const clarifications = 0;
 
   // Дела с низкой уверенностью тоже требуют вопроса — молчаливая догадка
   // здесь хуже прямого «не знаю».

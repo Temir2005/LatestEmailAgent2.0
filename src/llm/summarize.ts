@@ -93,18 +93,8 @@ export async function summarizeCases(
       provider: llm.name,
     });
 
-    for (const q of result.clarifications ?? []) {
-      await db.insertClarification({
-        case_id: c.id!,
-        question: q.question,
-        why_needed: q.why_needed,
-        answer_type: q.answer_type,
-        options: q.options?.length ? JSON.stringify(q.options) : null,
-        status: "pending",
-        provider: llm.name,
-      });
-      clarifications++;
-    }
+    // Сводка вопросов пользователю не заводит: чего не хватает по существу
+    // переписки, агент спрашивает у клиники письмом, а не у вас.
 
     summarized++;
   }

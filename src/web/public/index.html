@@ -9,203 +9,198 @@
 </head>
 <body>
 
+<!-- Иконки одним спрайтом: один стиль, одна толщина штриха, без эмодзи. -->
+<svg class="sprite" aria-hidden="true">
+  <symbol id="i-chat" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M21 15a2 2 0 0 1-2 2H8l-4 3V6a2 2 0 0 1 2-2h13a2 2 0 0 1 2 2z"/>
+  </symbol>
+  <symbol id="i-ask" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="12" r="9"/><path d="M9.5 9a2.5 2.5 0 1 1 3.2 2.4c-.6.2-1 .8-1 1.4v.4"/><path d="M12 17h.01"/>
+  </symbol>
+  <symbol id="i-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M5 12h14M13 6l6 6-6 6"/>
+  </symbol>
+  <symbol id="i-back" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M19 12H5M11 18l-6-6 6-6"/>
+  </symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>
+  </symbol>
+  <symbol id="i-send" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M22 2 11 13M22 2l-7 20-4-9-9-4z"/>
+  </symbol>
+  <symbol id="i-calendar" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="3" y="5" width="18" height="16" rx="2"/><path d="M8 3v4M16 3v4M3 11h18"/>
+  </symbol>
+  <symbol id="i-close" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M18 6 6 18M6 6l12 12"/>
+  </symbol>
+  <symbol id="i-mail" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7 9 6 9-6"/>
+  </symbol>
+  <symbol id="i-user" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>
+  </symbol>
+</svg>
+
 <div class="app">
   <div class="rule"></div>
 
   <header class="head">
-    <a class="logo" href="#/cases" title="Alatau Advance Air Group">
-      <svg viewBox="0 0 232 74" aria-label="AAAG">
-        <g fill="currentColor">
-          <path d="M0 66 L30 6 L42 6 L72 66 L54 66 L36 28 L18 66 Z"/>
-          <path d="M46 66 L76 6 L88 6 L118 66 L100 66 L82 28 L64 66 Z"/>
-          <path d="M92 66 L122 6 L134 6 L164 66 L146 66 L128 28 L110 66 Z"/>
-          <path d="M200 6 a30 30 0 1 0 0 60 h30 V33 h-30 v14 h14 v5 a17 17 0 1 1 0-32 h16 V6 Z"/>
-          <rect x="0" y="36" width="232" height="11"/>
-        </g>
-      </svg>
-      <span class="full">Alatau Advance Air Group</span>
-    </a>
+    <button class="burger" id="burger" aria-label="Настройки и профиль" aria-expanded="false">
+      <span></span><span></span><span></span>
+    </button>
 
-    <div>
-      <h1>Агент переписки с медицинскими клиниками</h1>
-      <p class="sub">Цепочки по техническим заголовкам · тематические дела · уточняющие вопросы</p>
+    <div class="head-title">
+      <h1>Переписка с клиниками</h1>
+      <p class="sub">Почта подключается и разбирается сама · агент отвечает по регламенту</p>
     </div>
 
-    <div class="slogan">
-      <b>Переосмысление возможного</b>
-      <span id="provider">—</span>
-    </div>
-  </header>
-
-  <nav class="nav">
-    <div class="nav-title">Разбор</div>
-    <button class="nav-item" data-route="cases">Дела <span class="count" id="n-cases">0</span></button>
-    <button class="nav-item" data-route="clarify">Вопросы агента <span class="count" id="n-pending">0</span></button>
-    <button class="nav-item" data-route="threads">Цепочки писем <span class="count" id="n-threads">0</span></button>
-
-    <div class="nav-title">Работа</div>
-    <button class="nav-item" data-route="chat">Чат по переписке</button>
-    <button class="nav-item" data-route="sources">Источники писем</button>
-
-    <div class="nav-foot">
+    <div class="head-side">
       <div class="watcher" id="watcher">
-        <span class="dot" id="watch-dot"></span>
+        <span class="dot"></span>
         <span id="watch-text">дозагрузка: —</span>
       </div>
-      писем в базе: <b id="n-emails">0</b><br>
-      рассылок отсеяно: <b id="n-bulk">0</b><br>
-      ваш адрес: <b id="self">—</b>
+      <div class="head-stats">
+        <span title="писем в базе">писем <b id="n-emails">0</b></span>
+        <span title="встреч записано в календарь">встреч <b id="n-meetings">0</b></span>
+      </div>
     </div>
-  </nav>
+
+    <a class="logo" href="#/inbox" title="Alatau Advance Air Group">
+      <img src="logo.png" alt="Alatau Advance Air Group">
+    </a>
+  </header>
 
   <main class="main">
 
-    <!-- ─── Дела ─────────────────────────────────────────────────────── -->
-    <section class="view" id="v-cases">
+    <!-- ─── Главный экран: вся нужная переписка ──────────────────────── -->
+    <section class="view" id="v-inbox">
       <div class="view-head">
         <div>
-          <h2>Тематические дела</h2>
-          <p>Переписка, разложенная по смыслу. Одно дело может собирать несколько технических
-             цепочек — и наоборот, одна цепочка может распасться на два дела.</p>
+          <h2>Вся переписка</h2>
+          <p>Письма от клиник попадают сюда сами. Агент отвечает по регламенту,
+             а там, где решать вам, — спрашивает прямо в карточке.</p>
         </div>
         <div class="actions">
           <button class="btn" id="b-reanalyze">Разобрать заново</button>
         </div>
       </div>
-      <div id="cases-list"></div>
+
+      <div class="filters" id="filters" role="tablist" aria-label="Фильтр переписки"></div>
+      <div id="inbox-list"></div>
     </section>
 
     <!-- ─── Карточка дела ────────────────────────────────────────────── -->
     <section class="view" id="v-case" hidden>
       <div class="view-head">
         <div>
-          <button class="btn ghost small" id="b-back">← Все дела</button>
-          <h2 id="case-topic" style="margin-top:10px">—</h2>
+          <button class="btn ghost small" id="b-back">
+            <svg class="ico"><use href="#i-back"/></svg> Вся переписка
+          </button>
+          <h2 id="case-topic">—</h2>
           <p id="case-clinic"></p>
         </div>
         <div class="actions">
-          <button class="btn" id="b-draft">Черновик ответа</button>
-          <button class="btn primary" id="b-case-chat">Спросить агента</button>
+          <button class="btn" id="b-draft">Подготовить ответ</button>
+          <button class="btn primary" id="b-case-chat">
+            <svg class="ico"><use href="#i-chat"/></svg> Спросить агента
+          </button>
         </div>
       </div>
       <div id="case-body"></div>
     </section>
 
-    <!-- ─── Вопросы ──────────────────────────────────────────────────── -->
-    <section class="view" id="v-clarify" hidden>
-      <div class="view-head">
-        <div>
-          <h2>Агент не смог разобраться сам</h2>
-          <p>Когда письмо непонятно контекстно, агент не угадывает, а спрашивает.
-             Ответ становится фактом и подмешивается во все дальнейшие разборы —
-             один и тот же вопрос второй раз не задаётся.</p>
-        </div>
-      </div>
-      <div id="clarify-list"></div>
-      <div id="facts-block"></div>
-    </section>
-
-    <!-- ─── Цепочки ──────────────────────────────────────────────────── -->
-    <section class="view" id="v-threads" hidden>
-      <div class="view-head">
-        <div>
-          <h2>Технические цепочки</h2>
-          <p>Уровень без ИИ: письма связаны по <b>Message-ID</b>, <b>In-Reply-To</b> и
-             <b>References</b> (RFC 5322). Где заголовков не хватило, цепочка собрана
-             эвристикой — тема, участники, окно по времени — и помечена честно.</p>
-        </div>
-      </div>
-      <div id="threads-table"></div>
-    </section>
-
-    <!-- ─── Цепочка целиком ──────────────────────────────────────────── -->
-    <section class="view" id="v-thread" hidden>
-      <div class="view-head">
-        <div>
-          <button class="btn ghost small" id="b-thread-back">← Все цепочки</button>
-          <h2 id="thread-subject" style="margin-top:10px">—</h2>
-          <p id="thread-meta"></p>
-        </div>
-      </div>
-      <div id="thread-body"></div>
-    </section>
-
-    <!-- ─── Чат ──────────────────────────────────────────────────────── -->
-    <section class="view" id="v-chat" hidden>
-      <div class="view-head">
-        <div>
-          <h2 id="chat-title">Чат по всей переписке</h2>
-          <p id="chat-sub">Здесь можно спрашивать о переписке, искать письма, добавлять их в дела и готовить письма к отправке.</p>
-        </div>
-        <div class="actions">
-          <button class="btn ghost small" id="b-chat-clear">Очистить</button>
-        </div>
-      </div>
-      <div class="chat-log" id="chat-log"></div>
-      <form class="chat-form" id="chat-form">
-        <textarea id="chat-input" placeholder="Например: «покажи последнее письмо от Иванова» или «напиши письмо на…»"></textarea>
-        <button class="btn primary" type="submit">Отправить</button>
-      </form>
-    </section>
-
-    <!-- ─── Источники ────────────────────────────────────────────────── -->
-    <section class="view" id="v-sources" hidden>
-      <div class="view-head">
-        <div>
-          <h2>Источники писем</h2>
-          <p>Демо-корпус — готовая тест-фикстура с намеренно поломанным threading.
-             IMAP — ваш реальный ящик, доступ только на чтение.</p>
-        </div>
-      </div>
-
-      <div class="card">
-        <p class="panel-title">Демо-корпус</p>
-        <p style="margin:0 0 12px">10 писем от трёх организаций: корректная цепочка с References,
-           счёт от noreply без заголовков, разорванная посередине цепочка, письмо с двумя разными
-           вопросами и письмо без контекста вовсе. На нём видно всё поведение агента сразу.</p>
-        <button class="btn primary" id="b-demo">Загрузить демо-корпус</button>
-      </div>
-
-      <div class="card">
-        <p class="panel-title">Живой ящик по IMAP</p>
-        <p style="margin:0 0 12px">Читает почту по учётным данным из <code>.env</code>.
-           Письма не удаляются и не помечаются прочитанными. Массовые рассылки отсеиваются
-           по заголовкам <code>List-Unsubscribe</code> и <code>Precedence</code> ещё до разбора.</p>
-        <div class="q-form">
-          <label style="display:flex;align-items:center;gap:8px">
-            Глубина, дней:
-            <input type="number" id="sync-days" value="90" min="1" max="3650" style="width:96px;padding:8px 11px;border:1px solid var(--navy-line);border-radius:4px">
-          </label>
-          <button class="btn primary" id="b-imap">Синхронизировать</button>
-        </div>
-      </div>
-
-      <div class="card">
-        <p class="panel-title">Автопилот</p>
-        <p style="margin:0">Демон дозагрузки сам ведёт переписку: как только по делу приходит
-           письмо, требующее ответа, агент готовит его и отправляет по SMTP сам, без клика
-           «Подтвердить отправку» — с корректными <code>In-Reply-To</code> / <code>References</code>,
-           чтобы клиника увидела ответ в той же цепочке. Если не хватает контекста — не гадает,
-           а спрашивает на вкладке «Вопросы агента». Отключается переменной окружения
-           <code>AUTOPILOT=0</code>. Отправка из чата (кнопка «Составить письмо») — отдельный путь,
-           там подтверждение по-прежнему нужно.</p>
-      </div>
-
-      <div class="card">
-        <p class="panel-title">Куда уходят тексты</p>
-        <p style="margin:0">Разбор идёт через API выбранного провайдера — тексты писем покидают
-           машину. На этапе отбора медицинской переписки отправляются только отправитель, тема
-           и даты; тела писем уходят лишь для отобранных цепочек. У Gemini выставлен
-           <code>store: false</code>, поэтому интеракции на их стороне не сохраняются.</p>
-      </div>
-    </section>
-
   </main>
 </div>
 
+<!-- ─── Боковая панель: профиль и настройки ─────────────────────────── -->
+<div class="drawer-scrim" id="drawer-scrim" hidden></div>
+<aside class="drawer" id="drawer" hidden aria-label="Настройки">
+  <header class="drawer-head">
+    <b>Настройки</b>
+    <button class="icon-btn dark" id="b-drawer-close" aria-label="Закрыть">
+      <svg class="ico"><use href="#i-close"/></svg>
+    </button>
+  </header>
+
+  <div class="drawer-body">
+    <section class="drawer-block">
+      <p class="drawer-title">Профиль</p>
+      <div class="profile">
+        <div class="avatar" aria-hidden="true">
+          <svg class="ico"><use href="#i-user"/></svg>
+        </div>
+        <div>
+          <b id="profile-name">Вы не вошли</b>
+          <span id="profile-mail">агент работает на ящике из настроек</span>
+        </div>
+      </div>
+      <button class="btn ghost wide" id="b-login">Войти</button>
+    </section>
+
+    <section class="drawer-block">
+      <p class="drawer-title">Агент</p>
+      <label class="switch">
+        <span>
+          <b>Автопилот</b>
+          <small id="autopilot-note">сам отвечает клиникам по регламенту</small>
+        </span>
+        <input type="checkbox" id="autopilot-toggle" role="switch">
+        <span class="track" aria-hidden="true"></span>
+      </label>
+      <button class="btn ghost wide" id="b-policy">Показать регламент</button>
+    </section>
+
+    <section class="drawer-block">
+      <p class="drawer-title">Подключение</p>
+      <dl class="drawer-kv">
+        <dt>Ящик</dt><dd id="set-mailbox">—</dd>
+        <dt>Модель</dt><dd id="set-model">—</dd>
+        <dt>Регламент</dt><dd id="set-policy">—</dd>
+      </dl>
+      <p class="drawer-note">Почта подключается демоном автоматически, вручную ничего запускать не нужно.</p>
+    </section>
+
+    <section class="drawer-block">
+      <p class="drawer-title">Обслуживание</p>
+      <button class="btn ghost wide" id="b-reanalyze-2">Разобрать переписку заново</button>
+      <button class="btn ghost wide" id="b-demo">Загрузить демо-корпус</button>
+    </section>
+  </div>
+</aside>
+
+<!-- ─── Чат: плавающая кнопка и панель ──────────────────────────────── -->
+<button class="fab" id="fab" aria-label="Открыть чат с агентом" aria-expanded="false">
+  <svg class="ico"><use href="#i-chat"/></svg>
+  <span class="fab-badge" id="fab-badge" hidden></span>
+</button>
+
+<aside class="dock" id="dock" hidden aria-label="Чат с агентом">
+  <header class="dock-head">
+    <div>
+      <b id="chat-title">Чат с агентом</b>
+      <span id="chat-sub">спросите про переписку или попросите написать письмо</span>
+    </div>
+    <div class="dock-tools">
+      <button class="dock-clear" id="b-chat-clear">Очистить</button>
+      <button class="icon-btn" id="b-chat-close" title="Свернуть чат" aria-label="Свернуть чат">
+        <svg class="ico"><use href="#i-close"/></svg>
+      </button>
+    </div>
+  </header>
+  <div class="chat-log" id="chat-log"></div>
+  <form class="chat-form" id="chat-form">
+    <textarea id="chat-input" rows="1" placeholder="Спросите агента…"></textarea>
+    <button class="btn primary" type="submit" aria-label="Отправить">
+      <svg class="ico"><use href="#i-send"/></svg>
+    </button>
+  </form>
+</aside>
+
 <!-- Прогресс долгой операции -->
 <div class="scrim" id="scrim" hidden>
-  <div class="job">
+  <div class="job" role="dialog" aria-modal="true" aria-labelledby="job-title">
     <div class="job-head" id="job-title">Работаю…</div>
     <div class="job-body">
       <div class="bar"><span id="job-bar"></span></div>
@@ -215,7 +210,7 @@
   </div>
 </div>
 
-<div class="toast" id="toast" hidden></div>
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 
 <script src="app.js"></script>
 </body>

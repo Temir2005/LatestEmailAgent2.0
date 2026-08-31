@@ -305,20 +305,21 @@ async function api(req: Request, url: URL): Promise<Response> {
 
   // — общее состояние —
   if (path === "/state" && method === "GET") {
-    const [cases, threadCounts, pendingCounts, stats, facts, watcher] = await Promise.all([
+    const [cases, threadCounts, pendingCounts, stats, facts, watcher, meetings] = await Promise.all([
       db.getCases(),
       db.getThreadCounts(),
       db.getPendingCounts(),
       db.stats(),
       db.getUserFacts(),
       db.getWatcherState(),
+      db.getMeetings(),
     ]);
 
     return json({
       provider: { name: cfg.provider, model: cfg.models[cfg.provider] },
       self: selfAddress,
       busy,
-      stats,
+      stats: { ...stats, meetings: meetings.length },
       watcher,
       cases: cases.map((c: Case) => ({
         ...c,
@@ -339,22 +340,58 @@ async function api(req: Request, url: URL): Promise<Response> {
     return json({ stats, watcher, busy });
   }
 
-  // — цепочки уровня 1: доказательство того, что разбор идёт по заголовкам —
+  // — настройки —
+  if (path === "/settings" && method === "GET") {
+    return json({
+      autopilot: (await db.getSetting("autopilot")) !== "off",
+      /** Переменной окружения интерфейс перебить не может — так и скажем. */
+      autopilotLockedByEnv: process.env.AUTOPILOT === "0",
+      mailbox: selfAddress,
+      provider: cfg.provider,
+      model: cfg.models[cfg.provider],
+      policyFile: process.env.POLICY_FILE?.trim() || "rag_clinic_agent_v2.md",
+    });
+  }
+
+  if (path === "/settings" && method === "POST") {
+    const body = (await req.json().catch(() => ({}))) as { autopilot?: boolean };
+    if (typeof body.autopilot === "boolean") {
+      await db.setSetting("autopilot", body.autopilot ? "on" : "off");
+    }
+    return json({ autopilot: (await db.getSetting("autopilot")) !== "off" });
+  }
+
+  /** Текст регламента — чтобы правила были видны из интерфейса, а не только в файле. */
+  if (path === "/policy" && method === "GET") {
+    try {
+      const { loadPolicy } = await import("../agent/policy.ts");
+      return json({ text: loadPolicy() });
+    } catch (err) {
+      return fail((err as Error).message, 404);
+    }
+  }
+
+  /**
+   * Все цепочки ящика — режим «Все письма» на главном экране.
+   *
+   * Показывает и то, что в дела не попало: письмо от клиники могло не
+   * пройти отбор, и без этого списка оно было бы невидимо совсем.
+   */
   if (path === "/threads" && method === "GET") {
     const threads = await db.getThreads();
-    const withCase = await Promise.all(
-      threads.map(async (t) => ({
+    const caseByThread = await db.caseIdsForThreads(threads.map((t) => t.id!));
+
+    return json({
+      threads: threads.map((t) => ({
         id: t.id,
         subject: t.subject,
         link_method: t.link_method,
         message_count: t.message_count,
         first_date: t.first_date,
         last_date: t.last_date,
-        root_message_id: t.root_message_id,
-        case_id: await db.caseIdForThread(t.id!),
+        case_id: caseByThread.get(t.id!) ?? null,
       })),
-    );
-    return json({ threads: withCase });
+    });
   }
 
   // — карточка дела —

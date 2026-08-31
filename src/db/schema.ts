@@ -219,6 +219,17 @@ CREATE TABLE IF NOT EXISTS sync_state (
   last_sync_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Настройки, меняемые из интерфейса.
+--
+-- Отдельно от .env: переменную окружения нельзя переключить, не перезапустив
+-- контейнер, а поставить автопилот на паузу нужно немедленно — например
+-- когда он начал отвечать не то.
+CREATE TABLE IF NOT EXISTS settings (
+  key        TEXT PRIMARY KEY,
+  value      TEXT NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- ─── Регламент переписки ──────────────────────────────────────────────────
 
 -- Календарь встреч.

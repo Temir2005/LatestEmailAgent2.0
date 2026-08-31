@@ -58,6 +58,13 @@ export async function runAutopilot(
 ): Promise<AutopilotResult> {
   if (process.env.AUTOPILOT === "0") return EMPTY;
 
+  // Пауза из интерфейса. Проверяется на каждом заходе, а не при старте:
+  // выключать автопилот приходится именно тогда, когда он уже работает.
+  if ((await db.getSetting("autopilot")) === "off") {
+    log(`поставлен на паузу в настройках — писем не отправляю`);
+    return EMPTY;
+  }
+
   const threads = await db.getThreads();
   if (threads.length === 0) return EMPTY;
 
