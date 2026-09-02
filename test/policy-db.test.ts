@@ -11,7 +11,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { ClinicDB } from "../src/db/db.ts";
 import { freshTestDb, SKIP_NOTE } from "./helpers/pg.ts";
 import { BUFFER_MINUTES, instantFrom } from "../src/agent/policy.ts";
-import { sentTooRecently } from "../src/agent/decide.ts";
+import { awaitingTheirAnswer } from "../src/agent/decide.ts";
 import type { EmailRecord } from "../src/types.ts";
 
 let db: ClinicDB | null = null;
@@ -90,7 +90,7 @@ describe("запрет писать после отказа §9", () => {
   });
 });
 
-describe("не больше письма в сутки в тред §9", () => {
+describe("очередь письма: §10", () => {
   const email = (isSent: boolean, hoursAgo: number): EmailRecord => ({
     message_id: `<m-${isSent}-${hoursAgo}@x>`,
     date_sent: new Date(Date.now() - hoursAgo * 3600_000).toISOString(),
@@ -98,15 +98,26 @@ describe("не больше письма в сутки в тред §9", () => {
     is_sent: isSent,
   });
 
-  test("письмо час назад блокирует новое", () => {
-    expect(sentTooRecently([email(false, 3), email(true, 1)])).toBe(true);
+  test("наше письмо час назад без ответа — второе не шлём", () => {
+    expect(awaitingTheirAnswer([email(false, 3), email(true, 1)])).toBe(true);
   });
 
-  test("после суток можно писать снова", () => {
-    expect(sentTooRecently([email(true, 25), email(false, 2)])).toBe(false);
+  test("клиника молчит сутки — можно напомнить", () => {
+    expect(awaitingTheirAnswer([email(false, 26), email(true, 25)])).toBe(false);
+  });
+
+  /**
+   * Тот самый случай с живого ящика: агент написал в 13:52, клиника ответила
+   * в 13:53 — и агент промолчал, потому что «письмо в этот тред уже уходило
+   * за последние сутки». Ответ на письмо клиники суточным лимитом не
+   * ограничен: очередь наша.
+   */
+  test("клиника ответила через минуту — отвечаем сразу", () => {
+    const emails = [email(false, 3), email(true, 1), email(false, 0.98)];
+    expect(awaitingTheirAnswer(emails)).toBe(false);
   });
 
   test("входящие лимит не расходуют", () => {
-    expect(sentTooRecently([email(false, 1), email(false, 2)])).toBe(false);
+    expect(awaitingTheirAnswer([email(false, 1), email(false, 2)])).toBe(false);
   });
 });

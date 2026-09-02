@@ -14,7 +14,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { ClinicDB } from "../src/db/db.ts";
 import { freshTestDb, SKIP_NOTE } from "./helpers/pg.ts";
-import { threadsMentioningClinic } from "../src/llm/triage.ts";
+import { threadsLookingRelevant } from "../src/llm/triage.ts";
 
 let db: ClinicDB | null = null;
 
@@ -57,7 +57,7 @@ describe("страховка отбора", () => {
   test("письмо клиники с gmail и подписью в конце забирается без модели", async () => {
     if (!db) return console.log(SKIP_NOTE);
 
-    const forced = threadsMentioningClinic(await db.getThreads(), await db.getEmailsByThreads(
+    const forced = threadsLookingRelevant(await db.getThreads(), await db.getEmailsByThreads(
       (await db.getThreads()).map((t) => t.id!),
     ));
 
@@ -68,14 +68,14 @@ describe("страховка отбора", () => {
   test("медицинская тема ловится и без тела", async () => {
     if (!db) return console.log(SKIP_NOTE);
     const threads = await db.getThreads();
-    const forced = threadsMentioningClinic(threads, await db.getEmailsByThreads(threads.map((t) => t.id!)));
+    const forced = threadsLookingRelevant(threads, await db.getEmailsByThreads(threads.map((t) => t.id!)));
     expect(forced.has("<mri@x>")).toBe(true);
   });
 
   test("доставка еды страховкой не подхватывается", async () => {
     if (!db) return console.log(SKIP_NOTE);
     const threads = await db.getThreads();
-    const forced = threadsMentioningClinic(threads, await db.getEmailsByThreads(threads.map((t) => t.id!)));
+    const forced = threadsLookingRelevant(threads, await db.getEmailsByThreads(threads.map((t) => t.id!)));
     // Иначе страховка втащила бы в разбор весь ящик и обессмыслила отбор.
     expect(forced.has("<glovo@x>")).toBe(false);
   });

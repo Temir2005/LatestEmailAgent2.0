@@ -1,10 +1,8 @@
 import type { ClinicDB } from "../../db/db.ts";
-import { rebuildThreads, syncDemo, syncEml } from "../../ingest/sync.ts";
-import { DEMO_USER_ADDRESS } from "../../ingest/seed.ts";
+import { rebuildThreads, syncEml } from "../../ingest/sync.ts";
 import { bold, dim, green, heading, yellow } from "../render.ts";
 
 export interface SyncOptions {
-  demo: boolean;
   eml?: string;
   imap: boolean;
   days: number;
@@ -16,11 +14,7 @@ export async function runSync(db: ClinicDB, options: SyncOptions): Promise<void>
 
   let loaded = 0;
 
-  if (options.demo) {
-    const result = await syncDemo(db);
-    loaded = result.emails;
-    console.log(`  ${green("✓")} демо-корпус: ${loaded} писем`);
-  } else if (options.eml) {
+  if (options.eml) {
     const result = await syncEml(db, options.eml, options.self);
     loaded = result.loaded;
     console.log(`  ${green("✓")} из ${options.eml}: ${result.loaded} писем`);
@@ -57,5 +51,3 @@ export async function runSync(db: ClinicDB, options: SyncOptions): Promise<void>
   console.log(dim(`\n  писем в базе: ${stats.emails}`));
   console.log(dim(`  Дальше: bun run cases`));
 }
-
-export { DEMO_USER_ADDRESS };

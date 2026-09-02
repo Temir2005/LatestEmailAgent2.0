@@ -93,6 +93,14 @@ export interface Case {
   provider?: string | null;
   created_at?: string;
   updated_at?: string;
+  /** Дата последнего письма в деле — по ней список и сортируется. */
+  last_activity?: string | null;
+  /**
+   * Последнее письмо в деле — наше (true) или клиники (false); null, если
+   * писем нет вовсе. Факт из базы: по нему экран решает, ждём мы ответа
+   * клиники или ход за нами. Статусу от модели этот вопрос не доверяем.
+   */
+  we_wrote_last?: boolean | null;
 }
 
 export interface CaseThread {
@@ -162,6 +170,8 @@ export interface Draft {
   subject: string;
   body: string;
   provider?: string | null;
+  /** Действие §4, которым было это письмо: book, clarify, farewell… */
+  action?: string | null;
   /** Отправлено ли уже — автопилотом, без ручного подтверждения. */
   sent_at?: string | null;
   auto?: boolean;

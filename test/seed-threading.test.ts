@@ -5,7 +5,8 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { ClinicDB } from "../src/db/db.ts";
-import { syncDemo } from "../src/ingest/sync.ts";
+import { rebuildThreads } from "../src/ingest/sync.ts";
+import { seedDemo } from "./helpers/demo-corpus.ts";
 import type { Thread } from "../src/types.ts";
 import { freshTestDb, SKIP_NOTE } from "./helpers/pg.ts";
 
@@ -18,7 +19,8 @@ beforeAll(async () => {
   db = await freshTestDb();
   if (!db) return;
 
-  await syncDemo(db);
+  await seedDemo(db);
+  await rebuildThreads(db);
   threads = await db.getThreads();
 
   const byThread = await db.getEmailsByThreads(threads.map((t) => t.id!));
@@ -109,7 +111,8 @@ describe("демо-корпус, уровень 1", () => {
   test("повторная загрузка ничего не дублирует", async () => {
     if (!db) return console.log(SKIP_NOTE);
     const before = await db.stats();
-    await syncDemo(db);
+    await seedDemo(db);
+  await rebuildThreads(db);
     expect((await db.stats()).emails).toBe(before.emails);
     expect(await db.getThreads()).toHaveLength(5);
   });

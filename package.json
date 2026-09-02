@@ -10,7 +10,6 @@
     "watch": "bun run src/ingest/watcher.ts",
     "migrate:sqlite": "bun run scripts/migrate-sqlite-to-pg.ts",
     "auth": "bun run auth-service/src/cli.ts",
-    "seed": "bun run src/cli/index.ts seed",
     "sync": "bun run src/cli/index.ts sync",
     "cases": "bun run src/cli/index.ts cases",
     "case": "bun run src/cli/index.ts case",

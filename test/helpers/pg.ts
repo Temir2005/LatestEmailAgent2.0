@@ -48,8 +48,17 @@ export async function freshTestDb(): Promise<ClinicDB | null> {
     await admin.close();
   }
 
+  lastTestUrl = testUrl;
   return ClinicDB.open(testUrl);
 }
+
+/**
+ * Адрес тестовой базы последнего `freshTestDb`. Нужен тестам, которым мало
+ * одного соединения: например проверке, что миграция соседнего процесса не
+ * ломает уже открытое.
+ */
+let lastTestUrl: string | null = null;
+export const testDbUrl = (): string | null => lastTestUrl;
 
 export const SKIP_NOTE =
   "  пропущено: нет Postgres (docker compose up -d db), проверки уровня 1 на демо-корпусе не выполнялись";

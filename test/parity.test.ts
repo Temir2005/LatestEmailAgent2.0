@@ -10,11 +10,12 @@
 
 import { beforeAll, describe, expect, test } from "bun:test";
 import type { ClinicDB } from "../src/db/db.ts";
-import { syncDemo } from "../src/ingest/sync.ts";
+import { rebuildThreads } from "../src/ingest/sync.ts";
+import { seedDemo } from "./helpers/demo-corpus.ts";
 import { classifyCases } from "../src/llm/classify.ts";
 import { overrideProvider } from "../src/config.ts";
 import { hasScope } from "../src/auth/client.ts";
-import { DEMO_USER_ADDRESS } from "../src/ingest/seed.ts";
+import { DEMO_USER_ADDRESS } from "./helpers/demo-corpus.ts";
 import { freshTestDb } from "./helpers/pg.ts";
 
 /** Разбиение цепочек по делам, независимое от порядка и от id. */
@@ -59,7 +60,8 @@ describe("паритет провайдеров", () => {
         console.log("  пропущено: нет Postgres (docker compose up -d db)");
         return;
       }
-      await syncDemo(db);
+      await seedDemo(db);
+  await rebuildThreads(db);
       overrideProvider(provider);
       await classifyCases(db, DEMO_USER_ADDRESS);
       results.push(await partitionOf(db));

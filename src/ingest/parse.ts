@@ -38,6 +38,11 @@ export interface ParseOptions {
   selfAddress?: string;
 }
 
+/** Первая строка письма для списков — её же кладут и наши исходящие. */
+export function makeSnippet(bodyText: string): string {
+  return bodyText.slice(0, 200).replace(/\s+/g, " ").trim();
+}
+
 export function parseEmail(parsed: ParsedMail, options: ParseOptions = {}): ParsedEmail {
   const from = addressList(parsed.from)[0];
   const fromAddress = from?.address ?? "unknown@unknown";
@@ -79,7 +84,7 @@ export function parseEmail(parsed: ParsedMail, options: ParseOptions = {}): Pars
     reply_to: addressList(parsed.replyTo)[0]?.address ?? null,
     body_text: bodyText,
     body_html: typeof parsed.html === "string" ? parsed.html : null,
-    snippet: bodyText.slice(0, 200).replace(/\s+/g, " ").trim(),
+    snippet: makeSnippet(bodyText),
     is_read: flags.includes("\\Seen"),
     is_sent:
       options.folder?.toLowerCase().includes("sent") ||

@@ -41,6 +41,9 @@
   <symbol id="i-user" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
     <circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>
   </symbol>
+  <symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>
+  </symbol>
 </svg>
 
 <div class="app">
@@ -74,12 +77,23 @@
 
   <main class="main">
 
+    <!-- ─── Поиск: первая строка экрана, над всей перепиской ─────────── -->
+    <form class="search" id="search-form" role="search">
+      <svg class="ico" aria-hidden="true"><use href="#i-search"/></svg>
+      <input id="search-input" type="search" autocomplete="off" spellcheck="false"
+             placeholder="Поиск по письмам: тема, текст, адрес или клиника"
+             aria-label="Поиск по письмам">
+      <button type="button" class="search-clear" id="search-clear" hidden aria-label="Очистить">
+        <svg class="ico"><use href="#i-close"/></svg>
+      </button>
+    </form>
+
     <!-- ─── Главный экран: вся нужная переписка ──────────────────────── -->
     <section class="view" id="v-inbox">
       <div class="view-head">
         <div>
-          <h2>Вся переписка</h2>
-          <p>Письма от клиник попадают сюда сами. Агент отвечает по регламенту,
+          <h2>Почтовый ящик</h2>
+          <p>Все письма в одном списке, свежие сверху. Агент отвечает по регламенту,
              а там, где решать вам, — спрашивает прямо в карточке.</p>
         </div>
         <div class="actions">
@@ -87,8 +101,21 @@
         </div>
       </div>
 
-      <div class="filters" id="filters" role="tablist" aria-label="Фильтр переписки"></div>
       <div id="inbox-list"></div>
+    </section>
+
+    <!-- ─── Результаты поиска ────────────────────────────────────────── -->
+    <section class="view" id="v-search" hidden>
+      <div class="view-head">
+        <div>
+          <button class="btn ghost small" id="b-search-back">
+            <svg class="ico"><use href="#i-back"/></svg> Вся переписка
+          </button>
+          <h2 id="search-title">Поиск</h2>
+          <p id="search-sub">—</p>
+        </div>
+      </div>
+      <div id="search-body"></div>
     </section>
 
     <!-- ─── Карточка дела ────────────────────────────────────────────── -->
@@ -149,7 +176,17 @@
         <input type="checkbox" id="autopilot-toggle" role="switch">
         <span class="track" aria-hidden="true"></span>
       </label>
+      <label class="switch">
+        <span>
+          <b>Соглашаться со всем</b>
+          <small id="agree-note">тестовый режим: принимает любое время и отвечает утвердительно</small>
+        </span>
+        <input type="checkbox" id="agree-toggle" role="switch">
+        <span class="track" aria-hidden="true"></span>
+      </label>
       <button class="btn ghost wide" id="b-policy">Показать регламент</button>
+      <p class="drawer-note" id="since-note">—</p>
+      <button class="btn ghost wide" id="b-reset-since">Забыть старую почту</button>
     </section>
 
     <section class="drawer-block">
@@ -165,7 +202,6 @@
     <section class="drawer-block">
       <p class="drawer-title">Обслуживание</p>
       <button class="btn ghost wide" id="b-reanalyze-2">Разобрать переписку заново</button>
-      <button class="btn ghost wide" id="b-demo">Загрузить демо-корпус</button>
     </section>
   </div>
 </aside>

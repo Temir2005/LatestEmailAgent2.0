@@ -10,7 +10,6 @@
 import type { ClinicDB } from "../db/db.ts";
 import { loadConfig } from "../config.ts";
 import { collectParticipants, resolveThreads } from "../threading/resolver.ts";
-import { seedDemo } from "./seed.ts";
 import { loadFromPath } from "./eml-loader.ts";
 import { isBulkMail } from "../threading/bulk.ts";
 
@@ -49,11 +48,6 @@ export async function rebuildThreads(db: ClinicDB): Promise<RebuildResult> {
     bulkFiltered: await db.countBulk(),
     lostCaseLinks: links.lostLinks,
   };
-}
-
-export async function syncDemo(db: ClinicDB): Promise<{ emails: number } & RebuildResult> {
-  const { emails } = await seedDemo(db);
-  return { emails, ...(await rebuildThreads(db)) };
 }
 
 export async function syncEml(

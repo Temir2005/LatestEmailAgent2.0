@@ -48,7 +48,7 @@ describe("вердикт отбора запоминается", () => {
     await db.saveTriageVerdicts(
       threads.map((t) => ({
         root: t.root_message_id,
-        isMedical: t.root_message_id.includes("med"),
+        isRelevant: t.root_message_id.includes("med"),
       })),
     );
 
@@ -60,7 +60,7 @@ describe("вердикт отбора запоминается", () => {
   test("на классификацию идут только медицинские", async () => {
     if (!db) return console.log(SKIP_NOTE);
 
-    const medical = await db.medicalThreads();
+    const medical = await db.relevantThreads();
     expect(medical).toHaveLength(1);
     expect(medical[0]!.root_message_id).toBe("<med-1@clinic.ru>");
   });
@@ -74,6 +74,6 @@ describe("вердикт отбора запоминается", () => {
     await rebuildThreads(db);
 
     expect(await db.threadsNeedingTriage()).toHaveLength(0);
-    expect(await db.medicalThreads()).toHaveLength(1);
+    expect(await db.relevantThreads()).toHaveLength(1);
   });
 });

@@ -185,7 +185,9 @@ CREATE INDEX IF NOT EXISTS idx_chat_case ON chat_messages (case_id, id);
 
 CREATE TABLE IF NOT EXISTS drafts (
   id               INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  case_id          INTEGER NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+  -- NULL допустим намеренно: см. миграцию ниже — отправленное письмо
+  -- переживает пересборку дел, даже когда его дело исчезло.
+  case_id          INTEGER REFERENCES cases(id) ON DELETE SET NULL,
   in_reply_to      TEXT,
   email_references TEXT,
   to_address       TEXT NOT NULL,
@@ -200,13 +202,69 @@ CREATE TABLE IF NOT EXISTS drafts (
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Отправленные письма не должны исчезать вместе с делами.
+--
+-- Разбор сносит все дела (replaceCases → DELETE FROM cases) и собирает
+-- заново. При CASCADE вместе с ними пропадали и черновики, то есть
+-- единственная запись о том, что агент кому-то написал. Из пяти писем,
+-- ушедших за день, следы остались только от трёх — остальные стёр очередной
+-- разбор. Разобраться, кому агент написал и почему, стало невозможно.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.referential_constraints
+     WHERE constraint_name = 'drafts_case_id_fkey' AND delete_rule = 'CASCADE'
+  ) THEN
+    ALTER TABLE drafts DROP CONSTRAINT drafts_case_id_fkey;
+    ALTER TABLE drafts ALTER COLUMN case_id DROP NOT NULL;
+    ALTER TABLE drafts ADD CONSTRAINT drafts_case_id_fkey
+      FOREIGN KEY (case_id) REFERENCES cases(id) ON DELETE SET NULL;
+  END IF;
+END $$;
+
+
 -- Столбцы добавлены после первого релиза черновиков — ALTER, а не пересоздание
 -- таблицы, чтобы не терять то, что уже накопилось.
+-- Признак «это письмо только что пришло».
+--
+-- Ровно одна строка в таблице может нести его. Агент работает только с ней:
+-- всё остальное в базе — накопленный ящик, к которому он не прикасается.
+--
+-- Раньше «последнее письмо» вычислялось сортировкой на лету, и стоило разбору
+-- перетасовать дела, как под определение попадало не то письмо. Теперь это
+-- факт в базе, поставленный в момент загрузки, а не догадка во время чтения.
+ALTER TABLE emails ADD COLUMN IF NOT EXISTS is_new BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE INDEX IF NOT EXISTS idx_emails_is_new ON emails (is_new) WHERE is_new;
+
 ALTER TABLE drafts ADD COLUMN IF NOT EXISTS sent_at TIMESTAMPTZ;
 ALTER TABLE drafts ADD COLUMN IF NOT EXISTS auto BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE drafts ADD COLUMN IF NOT EXISTS sent_message_id TEXT;
 
+-- Каким действием §4 было это письмо: book, clarify, farewell…
+--
+-- Нужно ровно для одного вопроса: попрощались мы уже или нет. Молчать агенту
+-- разрешено только после собственного прощания, и решать это по статусу дела
+-- нельзя — статус пишет сводка, то есть модель, и «closed» появлялось там,
+-- где переписка на самом деле шла.
+ALTER TABLE drafts ADD COLUMN IF NOT EXISTS action TEXT;
+
 CREATE INDEX IF NOT EXISTS idx_drafts_case ON drafts (case_id);
+
+-- Уже отправленным письмам возвращаем текст.
+--
+-- Автопилот записывал своё письмо в базу одними заголовками, без тела: в
+-- переписке оно выглядело пустой карточкой «мы» — письмо как бы есть, а
+-- прочитать, что агент написал, негде. Сам текст при этом никуда не делся,
+-- он лежит в черновике, с которого письмо и отправляли (sent_message_id).
+--
+-- Трогаем только пустые тела, поэтому повторный запуск ничего не портит.
+UPDATE emails e
+   SET body_text = d.body,
+       snippet   = btrim(left(regexp_replace(d.body, '\\s+', ' ', 'g'), 200))
+  FROM drafts d
+ WHERE d.sent_message_id = e.message_id
+   AND e.is_sent
+   AND coalesce(e.body_text, '') = '';
 
 -- ─── Инкрементальный IMAP-синк ────────────────────────────────────────────
 
@@ -276,24 +334,76 @@ CREATE TABLE IF NOT EXISTS contact_bans (
 -- немедицинская цепочка в дело не попадает и потому вечно выглядит новой.
 CREATE TABLE IF NOT EXISTS triage_verdicts (
   root_message_id TEXT PRIMARY KEY,
-  is_medical      BOOLEAN NOT NULL,
+  is_relevant     BOOLEAN NOT NULL,
   decided_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Замок на разбор переписки. Разбор идёт в двух процессах — веб по кнопке
--- «Разобрать заново» и автопилот в демоне, — а replaceCases сносит все дела
--- целиком: два одновременных прогона затёрли бы друг друга.
+-- Колонка называлась is_medical, пока отбор выбирал медицинское из всего.
+-- Теперь смысл обратный: в дела идёт всё, кроме явного мусора, — и «медицинское»
+-- стало неверным именем. Переименование, а не новая колонка: вердикты нужно
+-- сохранить, они стоили запросов к провайдеру.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+     WHERE table_name = 'triage_verdicts' AND column_name = 'is_medical'
+  ) AND NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+     WHERE table_name = 'triage_verdicts' AND column_name = 'is_relevant'
+  ) THEN
+    ALTER TABLE triage_verdicts RENAME COLUMN is_medical TO is_relevant;
+  END IF;
+END $$;
+
+-- Склейки цепочек: «эти две цепочки — про одно и то же».
+--
+-- Отдельное письмо о той же встрече приходит с новым Message-ID и без
+-- In-Reply-To: заголовки не связывают его ни с чем, и в ящике появляется
+-- второе дело о той же договорённости. Решение, что это продолжение,
+-- принимается по смыслу и стоит запроса к модели — терять его нельзя.
+--
+-- Ключ — root_message_id, как и у вердиктов отбора: дела и цепочки
+-- пересобираются целиком при каждом разборе, суррогатные id этого не
+-- переживают, а корневой Message-ID остаётся.
+CREATE TABLE IF NOT EXISTS thread_links (
+  root_a    TEXT NOT NULL,
+  root_b    TEXT NOT NULL,
+  why       TEXT,
+  linked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (root_a, root_b)
+);
+
+-- Замки долгих работ агента — по имени.
+--
+--   analysis — разбор переписки: он идёт в двух процессах (веб по кнопке
+--              «Разобрать заново» и автопилот в демоне), а replaceCases сносит
+--              все дела целиком, и два прогона разом затёрли бы друг друга;
+--   reply    — ответ на новое письмо: два процесса, начавшие отвечать на одно
+--              и то же письмо, отправят клинике два письма.
+--
+-- Замок был один на обе работы, и это стоило пользователю всей автономности:
+-- разбор занимает минуты (сводка — запрос к модели на каждое дело), а ответ
+-- отсекается окном свежести в три минуты. Пока держался общий замок, каждый
+-- заход автопилота упирался в «разбор уже идёт», письмо старело и уходило за
+-- окно — за сутки не ушло ни одного ответа. Работы развели: разбор больше не
+-- держит ответ.
 --
 -- Аренда, а не голый флаг: процесс может умереть, не сняв замок, и тогда
--- разбор не запустился бы уже никогда. Просроченная аренда считается свободной.
-CREATE TABLE IF NOT EXISTS analysis_lock (
-  id         INTEGER PRIMARY KEY CHECK (id = 1),
+-- работа не запустилась бы уже никогда. Просроченная аренда считается свободной.
+CREATE TABLE IF NOT EXISTS agent_locks (
+  name       TEXT PRIMARY KEY,
   holder     TEXT,
   taken_at   TIMESTAMPTZ,
   expires_at TIMESTAMPTZ
 );
 
-INSERT INTO analysis_lock (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
+INSERT INTO agent_locks (name) VALUES ('analysis'), ('reply')
+ON CONFLICT (name) DO NOTHING;
+
+-- Замок был один и жил в своей таблице. Хранить в ней нечего — только
+-- сиюминутную аренду, — поэтому переносить нечего, а оставлять пустую таблицу
+-- значит держать в схеме второй, никем не используемый механизм замка.
+DROP TABLE IF EXISTS analysis_lock;
 
 -- Журнал демона: видно, жив ли он и когда в последний раз что-то принёс.
 CREATE TABLE IF NOT EXISTS watcher_state (

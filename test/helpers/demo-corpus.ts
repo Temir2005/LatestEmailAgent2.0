@@ -1,5 +1,14 @@
 /**
- * Демо-корпус. Это не декорация, а тест-фикстура: переписка сделана с
+ * Демо-корпус — фикстура тестов, и только их.
+ *
+ * Раньше лежал в `src/ingest/` и заряжался в боевую базу командой `seed` и
+ * кнопкой в интерфейсе. Там ему не место: выдуманные письма оказывались
+ * вперемешку с настоящими, их было не отличить, а автопилот приходилось
+ * защищать отдельным списком выдуманных доменов, чтобы он не писал
+ * несуществующим людям. Теперь фикстура доступна только отсюда — в приложение
+ * она попасть не может.
+ *
+ * Переписка сделана с намеренно поломанным threading: переписка сделана с
  * намеренно поломанным threading, потому что именно на этом проверяются
  * требования к агенту.
  *
@@ -15,8 +24,8 @@
  *      контекста нет, агент обязан спросить, а не угадать.
  */
 
-import type { ClinicDB } from "../db/db.ts";
-import { normalizeSubject } from "../threading/normalize.ts";
+import type { ClinicDB } from "../../src/db/db.ts";
+import { normalizeSubject } from "../../src/threading/normalize.ts";
 
 const ME = "ivanov.pa@example.com";
 const ME_NAME = "Иванов Пётр";
@@ -262,21 +271,3 @@ export async function seedDemo(db: ClinicDB): Promise<{ emails: number }> {
 
 /** Адрес пользователя в демо-корпусе — нужен командам, чтобы отличать «нас». */
 export const DEMO_USER_ADDRESS = ME;
-
-/**
- * Домены тест-фикстуры. Демо-корпус часто лежит в одной базе с живой почтой,
- * а автопилот отправляет письма по-настоящему — без этого списка он слал бы
- * их на выдуманные адреса от имени выдуманного «Иванова Петра».
- */
-export const DEMO_DOMAINS = [
-  "example.com",
-  "zdorovie-clinic.ru",
-  "labtest-med.ru",
-  "med-partner.ru",
-  "mail-service.ru",
-] as const;
-
-export const isDemoAddress = (address: string): boolean => {
-  const domain = address.toLowerCase().split("@")[1] ?? "";
-  return DEMO_DOMAINS.some((d) => domain === d);
-};

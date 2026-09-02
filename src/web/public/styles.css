@@ -257,8 +257,12 @@ h1, h2, h3 { line-height: 1.25; }
 .row.st-ask  { box-shadow: inset 4px 0 0 var(--stop), var(--shadow); }
 .row.st-sent { box-shadow: inset 4px 0 0 var(--warn-dot), var(--shadow); }
 .row.st-done { opacity: .72; }
+/* Единственное дело, которым агент занят прямо сейчас, — с полосой навигации.
+   Остальные (st-idle) остаются нейтральными: агент их не трогает. */
+.row.st-open { box-shadow: inset 4px 0 0 var(--navy), var(--shadow); }
 .row.st-ask:hover  { box-shadow: inset 4px 0 0 var(--stop), var(--shadow-lift); }
 .row.st-sent:hover { box-shadow: inset 4px 0 0 var(--warn-dot), var(--shadow-lift); }
+.row.st-open:hover { box-shadow: inset 4px 0 0 var(--navy), var(--shadow-lift); }
 
 .dot-state {
   width: 8px; height: 8px; border-radius: 50%; flex: none;
@@ -267,6 +271,7 @@ h1, h2, h3 { line-height: 1.25; }
 .st-ask  .dot-state { background: var(--stop); }
 .st-sent .dot-state { background: var(--warn-dot); }
 .st-done .dot-state { background: #C4C4C9; }
+.st-open .dot-state { background: var(--navy); }
 
 /* Свёрнутая строка: название, время, одна строка контекста. Больше в списке
    не нужно — подробности раскрываются по щелчку. */
@@ -429,8 +434,6 @@ h1, h2, h3 { line-height: 1.25; }
 .pill.waiting_us   { background: var(--stop-bg);   color: var(--stop); }
 .pill.closed       { background: #EEEEF0;          color: var(--shield); }
 .pill.unclear      { background: var(--stop-bg);   color: var(--stop); }
-.pill.rfc          { background: var(--ok-bg);     color: var(--ok); }
-.pill.heuristic    { background: var(--warn-bg);   color: var(--warn); }
 
 /* ─── Лента писем ────────────────────────────────────────────────────────── */
 
@@ -751,3 +754,86 @@ details.headers .hdr {
   }
   .fab { right: 16px; bottom: 16px; }
 }
+
+/* ─── Поиск по ящику ─────────────────────────────────────────────────────── */
+
+/* Поиск — первая строка рабочей области, над списком писем.
+   В шапке он стоял компактным полем сбоку и терялся среди счётчиков: искать
+   письмо приходят с этого экрана, и строка должна попадаться на глаза раньше
+   самого списка. */
+.search {
+  position: relative; display: flex; align-items: center;
+  background: var(--paper); border: 1px solid var(--navy-line);
+  border-radius: 999px; padding: 0 var(--s4); height: 46px;
+  /* Та же колонка, что и у списка писем: строка стоит над ним, а не над всей
+     страницей — иначе она уезжает шире содержимого и висит сама по себе. */
+  max-width: 940px; margin: 0 auto var(--s4);
+  box-shadow: var(--shadow);
+  transition: border-color var(--ease), box-shadow var(--ease);
+}
+.search:focus-within { border-color: var(--navy); box-shadow: 0 0 0 3px var(--navy-soft); }
+.search .ico { width: 18px; height: 18px; color: var(--shield); flex: none; }
+.search input {
+  border: 0; outline: 0; background: none;
+  flex: 1; min-width: 0; padding: 0 var(--s3); font-size: 15px;
+}
+.search input::placeholder { color: var(--muted); }
+.search input::-webkit-search-cancel-button { display: none; }
+.search-clear {
+  border: 0; background: none; cursor: pointer; padding: 2px;
+  display: flex; color: var(--shield); border-radius: 50%;
+}
+.search-clear:hover { color: var(--ink); background: var(--canvas); }
+/* Своё `display` перебивает [hidden] из таблицы браузера, и крестик оставался
+   виден над пустым полем. */
+.search-clear[hidden] { display: none; }
+/* То же и для самой строки: своё `display` перебивает [hidden] браузера. */
+.search[hidden] { display: none; }
+.search-clear .ico { width: 13px; height: 13px; }
+
+@media (max-width: 900px) {
+  .search { height: 42px; padding: 0 var(--s3); }
+  .search input { font-size: 14px; }
+}
+
+/* Найденное письмо: та же карточка, что и в ящике, но плотнее — выдача
+   читается пачкой, а не по одному. */
+.found {
+  background: var(--paper); border-radius: var(--radius-sm);
+  box-shadow: var(--shadow); margin-bottom: var(--s2);
+  overflow: hidden; transition: box-shadow var(--ease);
+}
+.found:hover { box-shadow: var(--shadow-lift); }
+.found.out { box-shadow: inset 3px 0 0 var(--navy-line), var(--shadow); }
+.found-main { padding: var(--s3) var(--s4); cursor: pointer; }
+.found-main:hover { background: #FBFBFD; }
+.found-case-row { padding: var(--s3) var(--s4); cursor: pointer; }
+
+.found-top { display: flex; align-items: baseline; gap: var(--s2); min-width: 0; }
+.found-dir {
+  font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--shield); border: 1px solid var(--hairline);
+  border-radius: 4px; padding: 0 5px; flex: none;
+}
+.found-subj {
+  font-size: 14.5px; font-weight: 600; color: var(--ink);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.found-when { margin-left: auto; font-size: 12px; color: var(--muted); flex: none; }
+.found-meta {
+  margin: 2px 0 0; display: flex; gap: var(--s2); align-items: baseline;
+  font-size: 12.5px; color: var(--muted); flex-wrap: wrap;
+}
+.found-who { color: var(--shield); }
+.found-case { color: var(--navy); font-weight: 600; }
+.found-nocase { color: var(--muted); font-style: italic; }
+.found-hl {
+  margin: var(--s1) 0 0; font-size: 13px; color: #444;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+/* Подсветку ставит база — по совпавшим словоформам, а не по строке запроса. */
+.found-hl mark {
+  background: #FBF1C7; color: inherit; border-radius: 3px; padding: 0 2px;
+}
+.found-body { padding: 0 var(--s4) var(--s3); border-top: 1px solid var(--hairline); }
+.found-note { margin: var(--s2) 0 0; font-size: 12.5px; color: var(--muted); }

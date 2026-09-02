@@ -28,7 +28,7 @@ import { ClinicDB } from "../db/db.ts";
 import { ImapClient } from "./imap-client.ts";
 import { syncFolder } from "./imap-sync.ts";
 import { rebuildThreads } from "./sync.ts";
-import { runAutopilot } from "../agent/autopilot.ts";
+import { analyzeInbox, replyToNewMail } from "../agent/autopilot.ts";
 
 const FOLDER = process.env.WATCH_FOLDER ?? "INBOX";
 /** Глубина первичной загрузки, если база пустая. */
@@ -69,6 +69,12 @@ let pendingPull: ReturnType<typeof setTimeout> | null = null;
 let pulling = false;
 /** Пока шёл догон, пришло ещё — повторить сразу после. */
 let pullAgain = false;
+/** Ответ уже готовится: второй параллельный отправит клинике второе письмо. */
+let replying = false;
+/** Разбор уже идёт: второй параллельный только сожжёт квоту. */
+let analyzing = false;
+/** До какого момента провайдер просил не беспокоить (исчерпанная квота). */
+let quotaColdUntil = 0;
 
 function schedulePull(reason: string): void {
   if (stopping) return;
@@ -88,6 +94,7 @@ async function pull(reason: string): Promise<void> {
   if (!client?.imap.isConnected) return;
 
   pulling = true;
+  let wantAutopilot = false;
   try {
     const result = await syncFolder(db, client.imap, FOLDER, INITIAL_DAYS, (m) => log(`! ${m}`));
 
@@ -110,9 +117,28 @@ async function pull(reason: string): Promise<void> {
       log(`! ${rebuilt.lostCaseLinks} привязок дел к цепочкам потеряно — цепочки слились`);
     }
 
+    /**
+     * Показать письмо, не спрашивая модель.
+     *
+     * Идёт до автопилота и намеренно вне его: разбор ходит в LLM и падает по
+     * своим причинам — кончилась квота, провайдер перегружен, — а почта из-за
+     * этого замирать не должна. Дело заводится сразу по факту цепочки, модель
+     * потом уточняет тему и объединяет дела.
+     */
+    const adopted = await db.adoptUncasedThreads();
+    if (adopted > 0) log(`новых цепочек в ящике: ${adopted}`);
+
+    // Признак «новое» ставится здесь, в момент загрузки, и ровно одному
+    // письму. Дальше агент работает только с ним; вся остальная база для
+    // него не существует.
+    const fresh = await db.markLatestIncomingAsNew();
+    if (fresh) log(`новое письмо: «${fresh.subject ?? "без темы"}»`);
+
     await db.setWatcherStatus("watching", `последнее письмо: ${new Date().toISOString()}`);
 
-    await runAutopilotSafely(client.imap.address, reason);
+    // Автопилот запускаем ПОСЛЕ снятия замка, ниже: он ходит в LLM и держать
+    // за собой загрузку почты не имеет права.
+    wantAutopilot = true;
   } catch (err) {
     log(`! догон не удался: ${(err as Error).message}`);
     await db.setWatcherStatus("error", (err as Error).message);
@@ -123,25 +149,106 @@ async function pull(reason: string): Promise<void> {
       schedulePull("догон вдогонку");
     }
   }
+
+  /**
+   * Загрузка почты и переписка агента развязаны намеренно.
+   *
+   * Раньше `runAutopilotSafely` вызывался внутри `try`, то есть под флагом
+   * `pulling`. Автопилот ходит в LLM, а тот на исчерпанной квоте отвечает не
+   * отказом, а повторами: 13 с + 56 с + 56 с + 56 с. Три с половиной минуты
+   * замок на загрузке держала неудачная попытка поговорить с моделью, и
+   * каждый десятисекундный опрос всё это время упирался в `if (pulling)`.
+   * Почта переставала приходить, хотя опрос честно тикал.
+   *
+   * Теперь замок снят до вызова: письма грузятся своим темпом, ответы агента
+   * идут своим. `void` здесь не забывчивость — ждать автопилот больше нельзя.
+   */
+  if (wantAutopilot && client?.imap.address) {
+    void runAutopilotSafely(client.imap.address, reason);
+  }
 }
 
 /**
- * Автопилот, который не может уронить демон.
+ * Ответ и разбор — две работы, а не одна.
  *
- * Разбор ходит в LLM, а тот падает по причинам, к почте отношения не
- * имеющим: перегрузка провайдера, кончившаяся квота, таймаут. Пробрасывать
- * такую ошибку наверх нельзя — вызывающий код решит, что порвалось
- * соединение с ящиком, и начнёт переподключаться по кругу.
+ * Ответ идёт первым и всегда: письмо живёт три минуты, и всё это время оно
+ * важнее любой аналитики. Разбор — следом и только если не идёт уже: он
+ * занимает минуты, и пока он шёл, общий флаг «автопилот работает» отбрасывал
+ * каждый следующий заход. Новое письмо, пришедшее во время разбора, ответа
+ * не получало вообще — именно так автопилот и замолчал на сутки.
  */
 async function runAutopilotSafely(selfAddress: string, reason: string): Promise<void> {
+  await runReplySafely(selfAddress, reason);
+  void runAnalysisSafely(selfAddress, reason);
+}
+
+/**
+ * Ответ клинике. Не может уронить демон и не ждёт разбора.
+ *
+ * Ходит в LLM, а тот падает по причинам, к почте отношения не имеющим:
+ * перегрузка провайдера, кончившаяся квота, таймаут. Пробрасывать такую
+ * ошибку наверх нельзя — вызывающий код решит, что порвалось соединение с
+ * ящиком, и начнёт переподключаться по кругу.
+ */
+async function runReplySafely(selfAddress: string, reason: string): Promise<void> {
+  // Опрос идёт раз в 10 секунд: без флага два захода взялись бы за одно
+  // письмо разом. Второй рубеж — замок в базе, он держит и другие процессы.
+  if (replying) return;
+
+  if (Date.now() < quotaColdUntil) {
+    const left = Math.ceil((quotaColdUntil - Date.now()) / 1000);
+    log(`ответ (${reason}): у провайдера кончилась квота, жду ещё ${left} с`);
+    return;
+  }
+
+  replying = true;
   try {
-    const auto = await runAutopilot(db, selfAddress, (m) => log(`автопилот: ${m}`));
+    const auto = await replyToNewMail(db, selfAddress, (m) => log(`автопилот: ${m}`));
     log(
-      `автопилот (${reason}): дел ${auto.cases}, отправлено ${auto.sent}, ` +
-        `пропущено ${auto.skipped}, ошибок ${auto.errors}`,
+      `ответ (${reason}): отправлено ${auto.sent}, пропущено ${auto.skipped}, ` +
+        `ошибок ${auto.errors}`,
     );
   } catch (err) {
-    log(`! автопилот (${reason}) не отработал: ${(err as Error).message}`);
+    noteFailure(`ответ (${reason})`, err as Error);
+  } finally {
+    replying = false;
+  }
+}
+
+/** Разбор ящика по делам: дорого, долго и ответу не мешает. */
+async function runAnalysisSafely(selfAddress: string, reason: string): Promise<void> {
+  if (analyzing) return;
+
+  if (Date.now() < quotaColdUntil) return;
+
+  analyzing = true;
+  try {
+    const auto = await analyzeInbox(db, selfAddress, (m) => log(`разбор: ${m}`));
+    log(`разбор (${reason}): дел ${auto.cases}`);
+  } catch (err) {
+    noteFailure(`разбор (${reason})`, err as Error);
+  } finally {
+    analyzing = false;
+  }
+}
+
+/** Разбор ошибки провайдера — общий для обеих работ. */
+function noteFailure(what: string, err: Error): void {
+  const message = err.message;
+  log(`! ${what} не отработал: ${message}`);
+
+  /**
+   * Квота — не сбой связи, а «сегодня больше нельзя».
+   *
+   * Без паузы каждый десятисекундный опрос снова уходил в четыре повтора
+   * по 56 секунд, впустую жёг остаток лимита и держал процесс занятым.
+   * Провайдер сам говорит, сколько ждать, — верим ему, иначе минута.
+   */
+  if (/quota|rate.?limit|превышена квота/i.test(message)) {
+    const hint = message.match(/retry in ([\d.]+)s/i);
+    const waitMs = hint ? Math.ceil(Number(hint[1]) * 1000) : 60_000;
+    quotaColdUntil = Date.now() + waitMs;
+    log(`автопилот: пауза ${Math.ceil(waitMs / 1000)} с — квота провайдера исчерпана`);
   }
 }
 
@@ -165,6 +272,11 @@ async function connect(): Promise<void> {
     log(`догон при старте: нового нет`);
   }
 
+  // На старте — тоже до автопилота: демон мог лежать как раз тогда, когда
+  // у провайдера кончилась квота, и цепочки остались без дел.
+  const adopted = await db.adoptUncasedThreads();
+  if (adopted > 0) log(`цепочек без дела подхвачено: ${adopted}`);
+
   // Автопилот на старте гоняем в любом случае, даже когда нового не пришло:
   // письмо могло прийти, пока демон лежал, и остаться без ответа. Иначе оно
   // провисит до следующего входящего.
@@ -173,7 +285,10 @@ async function connect(): Promise<void> {
   // ли провайдер LLM. Без этого перегруженный Gemini роняет connect(), тот
   // уходит в переподключение — и демон крутится в горячем цикле, дёргая
   // IMAP и API по кругу.
-  await runAutopilotSafely(imap.address, "старт");
+  // Тоже без ожидания: пока автопилот бьётся о квоту, IDLE ниже уже должен
+  // быть подписан, иначе первые минуты после старта письма идут только по
+  // страховочному опросу.
+  void runAutopilotSafely(imap.address, "старт");
 
   imap.watch((count) => {
     log(`сервер сообщил о новых письмах: ${count}`);
@@ -235,6 +350,20 @@ async function shutdown(signal: string): Promise<void> {
   try {
     client?.imap.unwatch();
     client?.imap.disconnect();
+
+    /**
+     * Замок разбора снимаем на выходе.
+     *
+     * Аренда рассчитана на процесс, умерший молча, и живёт 30 минут. Но при
+     * обычном перезапуске контейнера сигнал приходит, и оставлять после себя
+     * замок на полчаса незачем: новый демон поднимался и на каждом заходе
+     * писал «разбор уже идёт в другом процессе», хотя того процесса больше
+     * нет. Полчаса без разбора после каждого рестарта.
+     */
+    for (const name of ["analysis", "reply"]) {
+      if ((await db.lockHolder(name)) !== null) await db.releaseLock(name);
+    }
+
     await db.setWatcherStatus("stopped", `остановлен по ${signal}`);
     await db.close();
   } catch {

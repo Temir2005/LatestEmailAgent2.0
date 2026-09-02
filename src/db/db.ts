@@ -56,6 +56,17 @@ function toThread(row: Record<string, unknown>): Thread {
   };
 }
 
+/**
+ * Момент времени для параметра запроса — всегда строкой ISO.
+ *
+ * Соединение работает без подготовленных выражений (см. `open`), а там
+ * драйвер отдаёт `Date` в базу его собственным `toString()`:
+ * «Mon Sep 14 2026 11:00:00 GMT+0000 (Coordinated Universal Time)». Postgres
+ * такой timestamptz не разбирает и отвечает ошибкой на ровном месте.
+ */
+const at = (value: Date | string): string =>
+  value instanceof Date ? value.toISOString() : value;
+
 function toCase(row: Record<string, unknown>): Case {
   return {
     ...(row as unknown as Case),
@@ -87,10 +98,24 @@ export interface WatcherState {
 export class ClinicDB {
   private constructor(readonly sql: SQL) {}
 
-  /** Подключается и накатывает схему. DDL идемпотентный — гонки двух
-   *  стартующих контейнеров он переживает. */
+  /**
+   * Подключается и накатывает схему. DDL идемпотентный — гонки двух
+   * стартующих контейнеров он переживает.
+   *
+   * `prepare: false` — не оптимизация наоборот, а условие работоспособности.
+   * Схема накатывается при старте каждого процесса, а процессов несколько:
+   * веб, демон дозагрузки, разовые команды. Стоит одному из них добавить
+   * столбец, как у всех уже поднятых соединений планы запросов `SELECT *`
+   * становятся недействительны, и Postgres отвечает `cached plan must not
+   * change result type`. Ровно это и увидел пользователь вместо переписки:
+   * пустой экран и ошибка — из-за столбца, добавленного соседним процессом.
+   *
+   * Подготовленные выражения экономят разбор запроса; здесь это доли
+   * миллисекунды на ящик в тысячи писем. Работающий после миграции интерфейс
+   * дороже.
+   */
   static async open(url: string): Promise<ClinicDB> {
-    const sql = new SQL(url);
+    const sql = new SQL(url, { prepare: false });
     await sql.unsafe(SCHEMA_SQL);
     return new ClinicDB(sql);
   }
@@ -294,17 +319,6 @@ export class ClinicDB {
     }));
   }
 
-  /** Полнотекстовый поиск. Русская конфигурация даёт стемминг. */
-  async searchEmails(query: string, limit = 50): Promise<EmailRecord[]> {
-    const rows = await this.sql`
-      SELECT *, ts_rank(fts, plainto_tsquery('russian', ${query})) AS rank
-        FROM emails
-       WHERE fts @@ plainto_tsquery('russian', ${query})
-       ORDER BY rank DESC
-       LIMIT ${limit}`;
-    return rows.map(toEmail);
-  }
-
   /** Поиск из чата: фильтры можно сочетать, результат всегда от новых к старым. */
   async findEmails(query: string, sender: string, limit = 10): Promise<EmailRecord[]> {
     const rows = await this.sql`
@@ -321,6 +335,123 @@ export class ClinicDB {
     return rows.map(toEmail);
   }
 
+  /**
+   * Запрос пользователя → tsquery.
+   *
+   * Слова из строки поиска в запрос подставлять нельзя: `to_tsquery` — это
+   * язык со своим синтаксисом, и `&`, `!`, скобка или одиночная кавычка в
+   * тексте роняют его ошибкой. Оставляем только буквы и цифры, остальное —
+   * разделители.
+   *
+   * К последнему слову приписываем `:*`. Поиск идёт по мере набора, и без
+   * префикса «медос» не находит «медосмотр»: стемминг работает со словами
+   * целиком, а недописанное слово словом ещё не является.
+   */
+  private static tsQuery(query: string): string {
+    const words = query
+      .toLowerCase()
+      .split(/[^\p{L}\p{N}]+/u)
+      .filter(Boolean);
+    if (words.length === 0) return "";
+    return words.map((w, i) => (i === words.length - 1 ? `${w}:*` : w)).join(" & ");
+  }
+
+  /**
+   * Поиск по всему ящику: письма и дела.
+   *
+   * Ищет по индексу `fts` (русская конфигурация, стемминг) и заодно обычным
+   * вхождением по теме и адресу: адрес и латиница стеммингу не поддаются, а
+   * искать письмо по куску адреса — самый частый способ его найти.
+   *
+   * Подсветку делает база: `ts_headline` знает, какие именно словоформы
+   * совпали, — по самому запросу этого уже не восстановить. Границы помечаем
+   * управляющими символами, а не тегами: результат уходит в HTML, и разметку
+   * там ставит фронт, после экранирования.
+   */
+  async searchEmails(query: string, limit = 40): Promise<Array<EmailRecord & {
+    case_id: number | null;
+    case_topic: string | null;
+    highlight: string;
+  }>> {
+    const trimmed = query.trim();
+    if (!trimmed) return [];
+
+    const ts = ClinicDB.tsQuery(trimmed);
+    const like = `%${trimmed}%`;
+
+    const rows = await this.sql`
+      WITH q AS (SELECT ${ts}::text AS raw)
+      SELECT e.*,
+             ct.case_id,
+             c.topic AS case_topic,
+             ts_headline('russian',
+                         coalesce(e.body_text, e.snippet, ''),
+                         to_tsquery('russian', nullif((SELECT raw FROM q), '')),
+                         'StartSel=\u0001, StopSel=\u0002, MaxFragments=2, MaxWords=18, MinWords=6, FragmentDelimiter=" … "'
+             ) AS highlight
+        FROM emails e
+        LEFT JOIN case_threads ct ON ct.thread_id = e.thread_id
+        LEFT JOIN cases c ON c.id = ct.case_id
+       WHERE ((SELECT raw FROM q) <> '' AND e.fts @@ to_tsquery('russian', (SELECT raw FROM q)))
+          OR coalesce(e.subject, '') ILIKE ${like}
+          OR e.from_address ILIKE ${like}
+          OR coalesce(e.from_name, '') ILIKE ${like}
+       /*
+        * Свежие сверху — почта читается по времени. Но письмо, у которого
+        * запрос стоит прямо в теме или в адресе, поднимаем над остальными:
+        * иначе «10 сентября» выдаёт сначала рассылку авиакомпании, где эта
+        * дата встречается пять раз, и только потом письмо «Насчёт встречи
+        * 10 сентября».
+        */
+       ORDER BY (coalesce(e.subject, '') ILIKE ${like}
+                 OR e.from_address ILIKE ${like}
+                 OR coalesce(e.from_name, '') ILIKE ${like}) DESC,
+                e.date_sent DESC
+       LIMIT ${limit}`;
+
+    return rows.map((r: Record<string, unknown>) => ({
+      ...toEmail(r),
+      case_id: (r.case_id as number) ?? null,
+      case_topic: (r.case_topic as string) ?? null,
+      highlight: (r.highlight as string) ?? "",
+    }));
+  }
+
+  /** Дела, подходящие под запрос: по теме, сводке и названию клиники. */
+  async searchCases(query: string, limit = 10): Promise<Array<Case & { last_activity: string | null }>> {
+    const trimmed = query.trim();
+    if (!trimmed) return [];
+
+    const ts = ClinicDB.tsQuery(trimmed);
+    const like = `%${trimmed}%`;
+
+    const rows = await this.sql`
+      WITH q AS (SELECT ${ts}::text AS raw)
+      SELECT c.*, a.last_mail AS last_activity
+        FROM cases c
+        LEFT JOIN (
+          SELECT ct.case_id, max(e.date_sent) AS last_mail
+            FROM case_threads ct
+            JOIN emails e ON e.thread_id = ct.thread_id
+           GROUP BY ct.case_id
+        ) a ON a.case_id = c.id
+       WHERE ((SELECT raw FROM q) <> '' AND
+              to_tsvector('russian',
+                coalesce(c.topic, '') || ' ' || coalesce(c.summary, '') || ' ' ||
+                coalesce(c.clinic_name, '') || ' ' || coalesce(c.clinic_domain, ''))
+              @@ to_tsquery('russian', (SELECT raw FROM q)))
+          OR coalesce(c.topic, '') ILIKE ${like}
+          OR coalesce(c.clinic_name, '') ILIKE ${like}
+          OR coalesce(c.clinic_domain, '') ILIKE ${like}
+       ORDER BY a.last_mail DESC NULLS LAST, c.id DESC
+       LIMIT ${limit}`;
+
+    return rows.map((r: Record<string, unknown>) => ({
+      ...toCase(r),
+      last_activity: isoOrNull(r.last_activity),
+    }));
+  }
+
   // ─── Технические цепочки ─────────────────────────────────────────────────
 
   /**
@@ -331,11 +462,32 @@ export class ClinicDB {
    * снёс бы их все. Восстанавливаем по root_message_id — он переживает
    * пересборку, в отличие от суррогатного id.
    */
+  /**
+   * Номер консультативной блокировки, под которой идёт любая перестройка
+   * цепочек и дел.
+   *
+   * Пересборка цепочек (`replaceThreads`) удаляет все строки в `threads` и
+   * создаёт заново с новыми id. Разбор (`replaceCases`) в это же время держит
+   * в руках id, прочитанные до похода в LLM, — минуту назад. Пока загрузка
+   * почты и разбор шли под одним флагом в демоне, столкнуться они не могли;
+   * после того как их развязали, столкновение стало happen-before обычным
+   * делом и валило автопилот на каждом заходе:
+   *
+   *   insert or update on table "case_threads" violates foreign key constraint
+   *
+   * Консультативная блокировка PostgreSQL держится ровно до конца транзакции
+   * и снимается сама даже при падении процесса — в отличие от `analysis_lock`
+   * с получасовой арендой. Долгие вызовы LLM остаются снаружи, поэтому почта
+   * по-прежнему грузится, пока агент думает.
+   */
+  private static readonly REBUILD_LOCK = 4711;
+
   async replaceThreads(
     threads: Array<Omit<Thread, "id">>,
     assignment: Map<string, string>, // message_id → root_message_id
-  ): Promise<{ restoredLinks: number; lostLinks: number }> {
+  ): Promise<{ restoredLinks: number; lostLinks: number; droppedEmptyCases: number }> {
     return this.sql.begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(${ClinicDB.REBUILD_LOCK})`;
       const savedLinks = await tx`
         SELECT ct.case_id AS case_id, t.root_message_id AS root
           FROM case_threads ct
@@ -397,7 +549,26 @@ export class ClinicDB {
         await tx`INSERT INTO case_threads ${tx(restore)} ON CONFLICT DO NOTHING`;
       }
 
-      return { restoredLinks: restore.length, lostLinks };
+      /**
+       * Дело, оставшееся без единой цепочки, удаляем.
+       *
+       * Переписка при этом не теряется: корень исчезает только когда две
+       * цепочки слились в одну — пришло недостающее звено, — и все письма
+       * лежат в выжившей цепочке. Разбор заведёт по ней дело заново.
+       *
+       * Оставлять пустую оболочку нельзя. Писем в ней нет, поэтому она
+       * сортируется в конце и без времени, но в списке всё равно висит
+       * строка, за которой ничего не стоит, — и пользователь видит в ящике
+       * письмо, которого в ящике нет.
+       */
+      const [{ count: dropped }] = await tx`
+        WITH gone AS (
+          DELETE FROM cases c
+           WHERE NOT EXISTS (SELECT 1 FROM case_threads ct WHERE ct.case_id = c.id)
+          RETURNING 1
+        ) SELECT count(*)::int AS count FROM gone`;
+
+      return { restoredLinks: restore.length, lostLinks, droppedEmptyCases: dropped as number };
     });
   }
 
@@ -439,7 +610,7 @@ export class ClinicDB {
   /**
    * Цепочки, которые отбор ещё не смотрел.
    *
-   * Именно они, а не «цепочки без дела»: немедицинская переписка в дело не
+   * Именно они, а не «цепочки без дела»: отсеянная переписка в дело не
    * попадает никогда и потому вечно выглядела бы новой, гоняя дорогой разбор
    * по всему ящику на каждое письмо.
    */
@@ -454,22 +625,134 @@ export class ClinicDB {
   }
 
   /** Запоминает вердикт отбора, чтобы второй раз за него не платить. */
-  async saveTriageVerdicts(verdicts: Array<{ root: string; isMedical: boolean }>): Promise<void> {
+  async saveTriageVerdicts(verdicts: Array<{ root: string; isRelevant: boolean }>): Promise<void> {
     if (verdicts.length === 0) return;
     await this.sql`
       INSERT INTO triage_verdicts ${this.sql(
-        verdicts.map((v) => ({ root_message_id: v.root, is_medical: v.isMedical })),
+        verdicts.map((v) => ({ root_message_id: v.root, is_relevant: v.isRelevant })),
       )}
       ON CONFLICT (root_message_id) DO UPDATE SET
-        is_medical = EXCLUDED.is_medical, decided_at = now()`;
+        is_relevant = EXCLUDED.is_relevant, decided_at = now()`;
   }
 
-  /** Цепочки, признанные медицинскими, — вход для классификации по делам. */
-  async medicalThreads(): Promise<Thread[]> {
+  /** Цепочки, которые идут в дела: всё, кроме отсеянного как мусор. */
+  async relevantThreads(): Promise<Thread[]> {
     const rows = await this.sql`
       SELECT t.* FROM threads t
        JOIN triage_verdicts v ON v.root_message_id = t.root_message_id
-       WHERE v.is_medical
+       WHERE v.is_relevant
+       ORDER BY t.last_date DESC`;
+    return rows.map(toThread);
+  }
+
+  /**
+   * Заводит дело по каждой цепочке, которой ещё нет ни в одном деле.
+   *
+   * Без LLM, одним запросом. Это и есть починка главного: раньше письмо
+   * становилось видимым только после отбора и разбора, то есть после двух
+   * удачных походов к провайдеру. Кончилась квота — и ящик молча замирал:
+   * письма приходили, ложились в базу, собирались в цепочки и не появлялись
+   * на экране. Пользователь видел приложение, застрявшее на позавчерашней
+   * почте, без единого сообщения об ошибке.
+   *
+   * Теперь письмо видно сразу, а модель потом уточняет тему, объединяет
+   * цепочки и расставляет статусы. Провайдер отвечает за качество разбора,
+   * но не за то, увидите ли вы письмо.
+   *
+   * Цепочку, по которой отбор уже вынес «мусор», не трогаем. Цепочку без
+   * вердикта — берём: молчание отбора не повод прятать почту.
+   */
+  async adoptUncasedThreads(): Promise<number> {
+    return this.sql.begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(${ClinicDB.REBUILD_LOCK})`;
+      const orphans = await tx`
+        SELECT t.id,
+               COALESCE(NULLIF(t.subject, ''), 'Без темы') AS topic,
+               (SELECT split_part(e.from_address, '@', 2)
+                  FROM emails e
+                 WHERE e.thread_id = t.id AND NOT e.is_sent
+                 ORDER BY e.date_sent ASC LIMIT 1) AS domain
+          FROM threads t
+         WHERE NOT EXISTS (SELECT 1 FROM case_threads ct WHERE ct.thread_id = t.id)
+           AND NOT EXISTS (
+             SELECT 1 FROM triage_verdicts v
+              WHERE v.root_message_id = t.root_message_id AND NOT v.is_relevant
+           )
+         ORDER BY t.last_date ASC`;
+
+      for (const o of orphans) {
+        const [row] = await tx`
+          INSERT INTO cases (clinic_name, clinic_domain, topic, status, confidence, provider)
+          VALUES (NULL, ${(o.domain as string) || null}, ${o.topic as string}, 'unclear', 0, NULL)
+          RETURNING id`;
+        await tx`INSERT INTO case_threads (case_id, thread_id)
+                 VALUES (${row!.id as number}, ${o.id as number})
+                 ON CONFLICT DO NOTHING`;
+      }
+
+      return orphans.length;
+    });
+  }
+
+  /**
+   * Помечает последнее пришедшее письмо как новое — и снимает признак со всех
+   * остальных.
+   *
+   * Новым может быть ровно одно письмо. Это не оптимизация, а правило: агент
+   * работает только с ним, а вся остальная база для него не существует.
+   * Раньше он перебирал все дела подряд, и каждое из полутора сотен
+   * становилось кандидатом на ответ — достаточно одной ошибки отбора, чтобы
+   * письмо ушло постороннему. Так и случалось, дважды.
+   *
+   * Порядок — по `created_at`, времени попадания в базу, а не по дате из
+   * заголовка письма. Эти два порядка расходятся: письмо могло пролежать на
+   * сервере или прийти с неверными часами отправителя. «Последнее пришедшее»
+   * означает именно последнее загруженное.
+   *
+   * Исходящие не в счёт: отвечать на собственное письмо нечего.
+   */
+  async markLatestIncomingAsNew(): Promise<{ id: number; subject: string | null } | null> {
+    return this.sql.begin(async (tx) => {
+      await tx`UPDATE emails SET is_new = FALSE WHERE is_new`;
+
+      const [row] = await tx`
+        UPDATE emails SET is_new = TRUE
+         WHERE id = (
+           SELECT id FROM emails
+            WHERE NOT is_sent
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+         )
+        RETURNING id, subject`;
+
+      return row ? { id: row.id as number, subject: (row.subject as string) ?? null } : null;
+    });
+  }
+
+  /** Письмо, помеченное новым, вместе с делом, в котором оно лежит. */
+  async newEmailWithCase(): Promise<{ email: EmailRecord; caseId: number | null } | null> {
+    const [row] = await this.sql`
+      SELECT e.*, (
+        SELECT ct.case_id FROM case_threads ct WHERE ct.thread_id = e.thread_id LIMIT 1
+      ) AS case_id
+        FROM emails e
+       WHERE e.is_new
+       LIMIT 1`;
+    if (!row) return null;
+    return { email: toEmail(row), caseId: (row.case_id as number) ?? null };
+  }
+
+  /** Снимает признак новизны: письмо отработано, больше к нему не возвращаемся. */
+  async clearNewFlag(): Promise<void> {
+    await this.sql`UPDATE emails SET is_new = FALSE WHERE is_new`;
+  }
+
+  /** Отсеянное — то, что показывается в «Спаме». */
+  async spamThreads(): Promise<Thread[]> {
+    const rows = await this.sql`
+      SELECT t.* FROM threads t
+       JOIN triage_verdicts v ON v.root_message_id = t.root_message_id
+       WHERE NOT v.is_relevant
        ORDER BY t.last_date DESC`;
     return rows.map(toThread);
   }
@@ -478,17 +761,49 @@ export class ClinicDB {
    * Дела, в которых есть письма свежее последнего пересчёта сводки.
    * Пересводить остальные — впустую жечь квоту: переписка в них не менялась.
    */
-  async casesNeedingSummary(): Promise<Case[]> {
+  /**
+   * Дела, которым нужна сводка, — только живые и не больше бюджета за заход.
+   *
+   * Два ограничителя, и оба поставлены по счёту запросов.
+   *
+   * Первый: `since`. Разбор сносит все дела и создаёт заново, поэтому
+   * `summary IS NULL` становится верно сразу для всех, и «пересводить только
+   * изменившиеся» превращалось в «пересводить всё». На ящике из 149 дел это
+   * 149 запросов за цикл — суточные 500 бесплатного тарифа уходили за три
+   * захода, и на ответы клиникам не оставалось ни одного. Сводка по письму
+   * Spotify с кодом входа стоила ровно столько же, сколько ответ клинике.
+   * Берём только переписку свежее отсечки: остальное — накопленный личный
+   * ящик, сводка по нему никому не нужна.
+   *
+   * Второй: `limit`. Жёсткий потолок на заход, чтобы разовый наплыв не
+   * выбрал остаток квоты. Недосведённые дела дождутся следующего цикла —
+   * сводка отстанет на минуту, ответ клинике не отстанет вовсе.
+   *
+   * Свежие сверху: если бюджета хватит не на всех, тратим его на то, что
+   * происходит сейчас.
+   */
+  async casesNeedingSummary(since?: string | null, limit = 25): Promise<Case[]> {
     const rows = await this.sql`
-      SELECT c.* FROM cases c
-       WHERE c.summary IS NULL
-          OR EXISTS (
-            SELECT 1
-              FROM case_threads ct
-              JOIN emails e ON e.thread_id = ct.thread_id
-             WHERE ct.case_id = c.id AND e.date_sent > c.updated_at
-          )
-       ORDER BY c.id ASC`;
+      SELECT c.*, a.last_mail
+        FROM cases c
+        JOIN (
+          SELECT ct.case_id, max(e.date_sent) AS last_mail
+            FROM case_threads ct
+            JOIN emails e ON e.thread_id = ct.thread_id
+           GROUP BY ct.case_id
+        ) a ON a.case_id = c.id
+       WHERE (${since ?? null}::timestamptz IS NULL OR a.last_mail >= ${since ?? null}::timestamptz)
+         AND (
+           c.summary IS NULL
+           OR EXISTS (
+             SELECT 1
+               FROM case_threads ct
+               JOIN emails e ON e.thread_id = ct.thread_id
+              WHERE ct.case_id = c.id AND e.date_sent > c.updated_at
+           )
+         )
+       ORDER BY a.last_mail DESC
+       LIMIT ${limit}`;
     return rows.map(toCase);
   }
 
@@ -537,6 +852,7 @@ export class ClinicDB {
     items: Array<{ data: Omit<Case, "id">; threadIds: number[] }>,
   ): Promise<number[]> {
     return this.sql.begin(async (tx) => {
+      await tx`SELECT pg_advisory_xact_lock(${ClinicDB.REBUILD_LOCK})`;
       // Отвечённые вопросы переживают пересборку дел. Они висят на cases
       // через ON DELETE CASCADE, а дела здесь сносятся целиком — без этого
       // отрыва ответы пользователя исчезали бы при каждом разборе, и агент
@@ -548,8 +864,30 @@ export class ClinicDB {
       // «дело 1» и не найдёт ничего.
       await tx`ALTER TABLE cases ALTER COLUMN id RESTART WITH 1`;
 
+      /**
+       * Цепочки, дожившие до этого момента.
+       *
+       * Блокировка выше убирает одновременность, но не устаревание: номера
+       * цепочек собраны в classify.ts ДО похода в модель, а тот занимает
+       * минуты. За это время пересборка могла пройти целиком и выдать
+       * цепочкам новые номера. Вставка по старым валила весь разбор:
+       *
+       *   insert or update on table "case_threads" violates foreign key
+       *
+       * Исчезнувшую цепочку молча пропускаем — она никуда не делась, просто
+       * называется иначе, и следующий заход подхватит её заново.
+       */
+      const alive = new Set<number>(
+        (await tx`SELECT id FROM threads`).map((r: Record<string, unknown>) => r.id as number),
+      );
+
       const ids: number[] = [];
       for (const item of items) {
+        const threadIds = item.threadIds.filter((id) => alive.has(id));
+        // Дело, у которого не осталось ни одной цепочки, не заводим: писем в
+        // нём нет, а пустая строка в ящике — то же самое, что письмо, которого
+        // не существует.
+        if (item.threadIds.length > 0 && threadIds.length === 0) continue;
         const [row] = await tx`
           INSERT INTO cases (clinic_name, clinic_domain, topic, status, awaiting,
                              next_step, deadline, summary, key_facts, confidence, provider)
@@ -563,9 +901,9 @@ export class ClinicDB {
         const id = row.id as number;
         ids.push(id);
 
-        if (item.threadIds.length > 0) {
+        if (threadIds.length > 0) {
           await tx`INSERT INTO case_threads ${tx(
-            item.threadIds.map((thread_id) => ({ case_id: id, thread_id })),
+            threadIds.map((thread_id) => ({ case_id: id, thread_id })),
           )} ON CONFLICT DO NOTHING`;
         }
       }
@@ -573,9 +911,164 @@ export class ClinicDB {
     });
   }
 
+  /**
+   * Дела, свежие сверху.
+   *
+   * Сортировка по времени последнего письма, а не по id: дела нумеруются
+   * заново при каждой пересборке, и порядок по номеру не связан с датами
+   * никак — в списке старое шло впереди нового вперемешку.
+   *
+   * Свежесть — это дата последнего письма и только она. Раньше при отсутствии
+   * писем подставлялось `updated_at`, но это время пересборки дел, а не время
+   * переписки: оно одинаково у всех дел и обновляется при каждом разборе.
+   * Дело, потерявшее письма, получало «сейчас» и всплывало на первое место
+   * поверх настоящей почты — ровно так призрак «Лаборатория ИНВИТРО» без
+   * единого письма оказался первым в ящике с отметкой «7 минут назад».
+   *
+   * Без писем дело уходит вниз и показывается без времени.
+   *
+   * Вместе с датой отдаём и то, чьё это письмо, — `we_wrote_last`.
+   *
+   * Экран обязан говорить про переписку факт, а не пересказывать статус от
+   * модели. «Уточняем у клиники» стояло у дела, куда агент не написал ни
+   * строчки: подпись выводилась из поля `awaiting`, которое сводка заполняет
+   * почти всегда. Теперь это ровно один вопрос к базе — последнее письмо в
+   * деле наше или их.
+   *
+   * Без писем поле пустое (null), а не false: «мы не писали» и «переписки
+   * нет» — разные вещи, и подпись у них тоже разная.
+   */
   async getCases(): Promise<Case[]> {
-    const rows = await this.sql`SELECT * FROM cases ORDER BY id ASC`;
-    return rows.map(toCase);
+    const rows = await this.sql`
+      SELECT c.*, a.last_mail AS last_activity, a.last_is_sent AS we_wrote_last
+        FROM cases c
+        LEFT JOIN (
+          SELECT DISTINCT ON (ct.case_id)
+                 ct.case_id, e.date_sent AS last_mail, e.is_sent AS last_is_sent
+            FROM case_threads ct
+            JOIN emails e ON e.thread_id = ct.thread_id
+           ORDER BY ct.case_id, e.date_sent DESC, e.id DESC
+        ) a ON a.case_id = c.id
+       ORDER BY a.last_mail DESC NULLS LAST, c.id DESC`;
+    return rows.map((r: Record<string, unknown>) => ({
+      ...toCase(r),
+      last_activity: isoOrNull(r.last_activity),
+      we_wrote_last: r.we_wrote_last == null ? null : Boolean(r.we_wrote_last),
+    }));
+  }
+
+  /**
+   * Дела, где уже переписывались с этим адресом, — кандидаты в продолжение.
+   *
+   * Отдельное письмо о той же встрече приходит с новым Message-ID и без
+   * In-Reply-To: по заголовкам оно ни к чему не привязано, и в ящике
+   * появляется вторым делом. «Насчёт встречи 10 сентября» оказалось отдельно
+   * от «Предложения о встрече», хотя речь про одну и ту же встречу, тот же
+   * человек и тот же час.
+   *
+   * Отбор здесь механический — тот же собеседник и свежесть; решает, продолжение
+   * это или новая тема, модель, и только среди этих кандидатов.
+   */
+  async recentCasesWith(
+    address: string,
+    excludeCaseId: number,
+    withinDays = 45,
+    limit = 8,
+  ): Promise<Array<Case & { last_activity: string | null }>> {
+    const rows = await this.sql`
+      SELECT c.*, a.last_mail AS last_activity
+        FROM cases c
+        JOIN (
+          SELECT ct.case_id, max(e.date_sent) AS last_mail
+            FROM case_threads ct
+            JOIN emails e ON e.thread_id = ct.thread_id
+           GROUP BY ct.case_id
+        ) a ON a.case_id = c.id
+       WHERE c.id <> ${excludeCaseId}
+         AND a.last_mail > now() - ${`${withinDays} days`}::interval
+         AND EXISTS (
+           SELECT 1 FROM case_threads ct
+             JOIN emails e ON e.thread_id = ct.thread_id
+            WHERE ct.case_id = c.id AND lower(e.from_address) = ${address.toLowerCase()}
+         )
+       ORDER BY a.last_mail DESC
+       LIMIT ${limit}`;
+    return rows.map((r: Record<string, unknown>) => ({
+      ...toCase(r),
+      last_activity: isoOrNull(r.last_activity),
+    }));
+  }
+
+  /**
+   * Запоминает, что две цепочки — про одно и то же.
+   *
+   * Пара хранится в одном порядке независимо от того, какую нашли первой:
+   * иначе одна и та же склейка ложилась бы в базу дважды.
+   */
+  async linkThreads(rootA: string, rootB: string, why: string): Promise<void> {
+    const [a, b] = rootA < rootB ? [rootA, rootB] : [rootB, rootA];
+    await this.sql`
+      INSERT INTO thread_links (root_a, root_b, why) VALUES (${a}, ${b}, ${why})
+      ON CONFLICT (root_a, root_b) DO NOTHING`;
+  }
+
+  /**
+   * Возвращает склеенные цепочки в одно дело после пересборки.
+   *
+   * Разбор сносит дела и собирает заново по своим соображениям — про
+   * продолжение переписки он не знает и разложил бы отмену встречи снова
+   * отдельно. Склейки применяются после него и восстанавливают связь.
+   *
+   * В дело с более ранним письмом: продолжение приезжает к начатому
+   * разговору, а не наоборот.
+   */
+  async applyThreadLinks(): Promise<number> {
+    const pairs = await this.sql`SELECT root_a, root_b FROM thread_links`;
+    let merged = 0;
+
+    for (const pair of pairs) {
+      const rows = await this.sql`
+        SELECT ct.case_id, min(t.first_date) AS started
+          FROM threads t
+          JOIN case_threads ct ON ct.thread_id = t.id
+         WHERE t.root_message_id IN (${pair.root_a as string}, ${pair.root_b as string})
+         GROUP BY ct.case_id
+         ORDER BY started ASC`;
+
+      if (rows.length < 2) continue;
+
+      const [into, ...rest] = rows.map((r: { case_id: number }) => r.case_id);
+      for (const from of rest) {
+        await this.mergeCases(from, into!);
+        merged++;
+      }
+    }
+
+    return merged;
+  }
+
+  /**
+   * Переносит всё из одного дела в другое и удаляет опустевшее.
+   *
+   * Переезжают не только цепочки: отправленные письма, вопросы и записанные
+   * встречи — это история дела, и потерять её при слиянии значит забыть, что
+   * агент уже кому-то написал и на что записался.
+   */
+  async mergeCases(fromId: number, intoId: number): Promise<void> {
+    if (fromId === intoId) return;
+
+    await this.sql.begin(async (tx) => {
+      await tx`
+        UPDATE case_threads SET case_id = ${intoId}
+         WHERE case_id = ${fromId}
+           AND thread_id NOT IN (SELECT thread_id FROM case_threads WHERE case_id = ${intoId})`;
+      await tx`UPDATE drafts SET case_id = ${intoId} WHERE case_id = ${fromId}`;
+      await tx`UPDATE clarifications SET case_id = ${intoId} WHERE case_id = ${fromId}`;
+      await tx`UPDATE meetings SET case_id = ${intoId} WHERE case_id = ${fromId}`;
+      await tx`DELETE FROM cases WHERE id = ${fromId}`;
+      // Дело ожило: в него приехала новая переписка, и сводку надо пересчитать.
+      await tx`UPDATE cases SET updated_at = now() WHERE id = ${intoId}`;
+    });
   }
 
   async getCaseById(id: number): Promise<Case | null> {
@@ -796,9 +1289,11 @@ export class ClinicDB {
 
   async insertDraft(d: Omit<Draft, "id" | "created_at">): Promise<number> {
     const [row] = await this.sql`
-      INSERT INTO drafts (case_id, in_reply_to, email_references, to_address, subject, body, provider)
+      INSERT INTO drafts (case_id, in_reply_to, email_references, to_address, subject,
+                          body, provider, action)
       VALUES (${d.case_id}, ${d.in_reply_to ?? null}, ${d.references ?? null},
-              ${d.to_address}, ${d.subject}, ${d.body}, ${d.provider ?? null})
+              ${d.to_address}, ${d.subject}, ${d.body}, ${d.provider ?? null},
+              ${d.action ?? null})
       RETURNING id`;
     return row.id as number;
   }
@@ -812,6 +1307,21 @@ export class ClinicDB {
       sent_at: isoOrNull(r.sent_at),
       created_at: isoOrNull(r.created_at) ?? undefined,
     }));
+  }
+
+  /**
+   * Чем закончилось последнее ОТПРАВЛЕННОЕ письмо по делу.
+   *
+   * По нему решается, вправе ли агент промолчать: молчание допустимо только
+   * после собственного прощания. Статус дела для этого не годится — его
+   * пишет сводка, и «closed» там появлялось посреди живой переписки.
+   */
+  async lastSentAction(caseId: number): Promise<string | null> {
+    const [row] = await this.sql`
+      SELECT action FROM drafts
+       WHERE case_id = ${caseId} AND sent_at IS NOT NULL
+       ORDER BY sent_at DESC LIMIT 1`;
+    return (row?.action as string) ?? null;
   }
 
   /** Черновик отправлен автопилотом, без ручного подтверждения. */
@@ -870,8 +1380,8 @@ export class ClinicDB {
       SELECT 1 FROM meetings
        WHERE owner = ${owner}
          AND status = 'booked'
-         AND starts_at < ${endsAt}::timestamptz + ${pad}::interval
-         AND ends_at   > ${startsAt}::timestamptz - ${pad}::interval
+         AND starts_at < ${at(endsAt)}::timestamptz + ${pad}::interval
+         AND ends_at   > ${at(startsAt)}::timestamptz - ${pad}::interval
        LIMIT 1`;
     return Boolean(row);
   }
@@ -895,7 +1405,7 @@ export class ClinicDB {
       INSERT INTO meetings (case_id, clinic_name, contact, topic, starts_at, ends_at,
                             format, location, owner)
       VALUES (${meeting.case_id}, ${meeting.clinic_name}, ${meeting.contact}, ${meeting.topic},
-              ${meeting.starts_at}, ${meeting.ends_at}, ${meeting.format}, ${meeting.location},
+              ${at(meeting.starts_at)}, ${at(meeting.ends_at)}, ${meeting.format}, ${meeting.location},
               ${meeting.owner})
       RETURNING id`;
     return row.id as number;
@@ -920,34 +1430,53 @@ export class ClinicDB {
   // ─── Замок на разбор ─────────────────────────────────────────────────────
 
   /**
-   * Берёт замок на разбор переписки, если он свободен. Разбор идёт в двух
-   * процессах (веб по кнопке и автопилот в демоне), а `replaceCases` сносит
-   * все дела разом — одновременный запуск затёр бы результат.
+   * Берёт именованный замок, если он свободен.
+   *
+   * Замков два, и разводить их обязательно: `analysis` держится минутами
+   * (сводка — запрос к модели на каждое дело), а `reply` обязан браться
+   * сразу, пока письмо не ушло за окно свежести. Пока замок был один на
+   * обе работы, разбор съедал окно, и ответы не уходили вовсе.
    *
    * Аренда с истечением: процесс может умереть, не сняв замок, и вечный
-   * флаг заблокировал бы разбор навсегда.
+   * флаг заблокировал бы работу навсегда.
    */
-  async acquireAnalysisLock(holder: string, leaseMinutes = 30): Promise<boolean> {
+  async acquireLock(name: string, holder: string, leaseMinutes = 30): Promise<boolean> {
     const [row] = await this.sql`
-      UPDATE analysis_lock
-         SET holder = ${holder}, taken_at = now(),
-             expires_at = now() + ${`${leaseMinutes} minutes`}::interval
-       WHERE id = 1 AND (holder IS NULL OR expires_at < now())
+      INSERT INTO agent_locks (name, holder, taken_at, expires_at)
+      VALUES (${name}, ${holder}, now(), now() + ${`${leaseMinutes} minutes`}::interval)
+      ON CONFLICT (name) DO UPDATE
+         SET holder = EXCLUDED.holder, taken_at = EXCLUDED.taken_at,
+             expires_at = EXCLUDED.expires_at
+       WHERE agent_locks.holder IS NULL OR agent_locks.expires_at < now()
       RETURNING holder`;
     return Boolean(row);
   }
 
-  async releaseAnalysisLock(): Promise<void> {
+  async releaseLock(name: string): Promise<void> {
     await this.sql`
-      UPDATE analysis_lock SET holder = NULL, taken_at = NULL, expires_at = NULL
-       WHERE id = 1`;
+      UPDATE agent_locks SET holder = NULL, taken_at = NULL, expires_at = NULL
+       WHERE name = ${name}`;
   }
 
   /** Кто сейчас держит замок, если держит. */
-  async analysisLockHolder(): Promise<string | null> {
+  async lockHolder(name: string): Promise<string | null> {
     const [row] = await this
-      .sql`SELECT holder FROM analysis_lock WHERE id = 1 AND expires_at > now()`;
+      .sql`SELECT holder FROM agent_locks WHERE name = ${name} AND expires_at > now()`;
     return (row?.holder as string) ?? null;
+  }
+
+  // Разбор — самый частый замок, и зовут его из трёх мест. Отдельные имена
+  // читаются лучше, чем строковый ключ в каждом вызове.
+  acquireAnalysisLock(holder: string, leaseMinutes = 30): Promise<boolean> {
+    return this.acquireLock("analysis", holder, leaseMinutes);
+  }
+
+  releaseAnalysisLock(): Promise<void> {
+    return this.releaseLock("analysis");
+  }
+
+  analysisLockHolder(): Promise<string | null> {
+    return this.lockHolder("analysis");
   }
 
   // ─── Состояние демона ────────────────────────────────────────────────────

@@ -2,7 +2,7 @@
 /**
  * Роутер команд.
  *
- *   bun run sync --demo | --eml <путь> | --imap [--days N]
+ *   bun run sync --eml <путь> | --imap [--days N]
  *   bun run cases [--reanalyze]
  *   bun run case <номер>
  *   bun run clarify
@@ -14,7 +14,6 @@
 
 import { loadConfig, overrideProvider, type ProviderName } from "../config.ts";
 import { ClinicDB } from "../db/db.ts";
-import { DEMO_USER_ADDRESS } from "../ingest/seed.ts";
 import { runSync } from "./commands/sync.ts";
 import { runCases } from "./commands/cases.ts";
 import { runCaseDetail } from "./commands/case.ts";
@@ -58,7 +57,6 @@ function usage(): void {
 ${bold("clinic-agent")} — агент для переписки с медицинскими клиниками
 
 ${bold("Загрузка")}
-  bun run sync --demo              демо-корпус (готовая тест-фикстура)
   bun run sync --eml <путь>        .eml-файлы или .mbox
   bun run sync --imap [--days 30]  живой ящик по IMAP
 
@@ -99,9 +97,10 @@ async function main(): Promise<void> {
   const cfg = loadConfig();
   const db = await ClinicDB.open(cfg.databaseUrl);
 
-  // Свой адрес: из IMAP-учётки, если она есть, иначе демо-адрес.
+  // Свой адрес: из IMAP-учётки либо явным флагом. Выдуманного запасного
+  // значения нет — писать от имени несуществующего человека нельзя.
   const selfFlag = flags.get("self");
-  let selfAddress = typeof selfFlag === "string" ? selfFlag : DEMO_USER_ADDRESS;
+  let selfAddress = typeof selfFlag === "string" ? selfFlag : "";
   if (typeof selfFlag !== "string" && (command === "sync" ? flags.has("imap") : false)) {
     const { getImapCredentials } = await import("../auth/client.ts");
     selfAddress = (await getImapCredentials()).address;
@@ -112,7 +111,6 @@ async function main(): Promise<void> {
       case "sync": {
         const days = Number.parseInt(String(flags.get("days") ?? "30"), 10);
         await runSync(db, {
-          demo: flags.has("demo"),
           eml: typeof flags.get("eml") === "string" ? (flags.get("eml") as string) : undefined,
           imap: flags.has("imap"),
           days: Number.isFinite(days) ? days : 30,
@@ -155,10 +153,6 @@ async function main(): Promise<void> {
         await runDraft(db, id, selfAddress, positional[1]);
         break;
       }
-
-      case "seed":
-        await runSync(db, { demo: true, imap: false, days: 30 });
-        break;
 
       default:
         console.error(red(`Неизвестная команда: ${command}`));

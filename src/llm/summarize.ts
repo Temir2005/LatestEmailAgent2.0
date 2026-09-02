@@ -44,8 +44,10 @@ export async function summarizeCases(
    * выжирает дневную квоту за один заход автопилота.
    */
   onlyChanged = false,
+  /** Не сводить переписку старше этого момента — обычно отсечка автопилота. */
+  since?: string | null,
 ): Promise<SummarizeResult> {
-  const cases = onlyChanged ? await db.casesNeedingSummary() : await db.getCases();
+  const cases = onlyChanged ? await db.casesNeedingSummary(since) : await db.getCases();
   if (cases.length === 0) return { summarized: 0, clarifications: 0, provider: "—" };
 
   const llm = await getLLM();

@@ -17,32 +17,38 @@
 import { join } from "node:path";
 import { loadConfig } from "../config.ts";
 import { ClinicDB } from "../db/db.ts";
-import { DEMO_USER_ADDRESS } from "../ingest/seed.ts";
-import { rebuildThreads, syncDemo } from "../ingest/sync.ts";
+import { rebuildThreads } from "../ingest/sync.ts";
 import { classifyCases } from "../llm/classify.ts";
 import { summarizeCases } from "../llm/summarize.ts";
-import { selectMedicalThreads } from "../llm/triage.ts";
+import { selectRelevantThreads } from "../llm/triage.ts";
 import { recordAnswer } from "../llm/clarify.ts";
 import { draftReply, NeedsClarificationError } from "../llm/draft.ts";
 import { getLLM, type Msg } from "../llm/index.ts";
 import { chatActionSystemPrompt, renderThread } from "../llm/prompts.ts";
 import { CHAT_ACTION_SCHEMA } from "../llm/schemas.ts";
 import { sendEmail, type OutgoingEmail } from "../email/smtp.ts";
+import { recordSentEmail } from "../email/outbox.ts";
+import { parseReferences } from "../threading/normalize.ts";
 import type { Attachment, Case, Clarification, EmailRecord, Recipient } from "../types.ts";
 
 const PUBLIC_DIR = join(import.meta.dir, "public");
 const cfg = loadConfig();
 const db = await ClinicDB.open(cfg.databaseUrl);
 
-/** Свой адрес: из IMAP-учётки, если она настроена, иначе демо-адрес. */
-let selfAddress = DEMO_USER_ADDRESS;
+/**
+ * Свой адрес — только из IMAP-учётки. Запасного значения нет намеренно: без
+ * подключённого ящика агент не знает, от чьего имени пишет, и подставлять
+ * сюда выдуманный адрес значит отправлять письма за подписью несуществующего
+ * человека. Пусть лучше интерфейс скажет, что почта не подключена.
+ */
+let selfAddress = "";
 let imapConfigured = false;
 try {
   const { getImapCredentials } = await import("../auth/client.ts");
   selfAddress = (await getImapCredentials()).address;
   imapConfigured = true;
 } catch {
-  // IMAP не настроен — работаем на демо-корпусе, это штатный режим.
+  // IMAP не настроен — работать не с чем, это видно в интерфейсе.
 }
 
 /**
@@ -61,7 +67,10 @@ interface ChatAction extends OutgoingEmail {
   case_id: number;
 }
 
-const pendingSends = new Map<string, { message: OutgoingEmail; expires: number }>();
+const pendingSends = new Map<
+  string,
+  { message: OutgoingEmail; expires: number; caseId: number | null }
+>();
 
 // ─── Вспомогательное ────────────────────────────────────────────────────────
 
@@ -84,6 +93,22 @@ const parseFacts = (raw: string | null | undefined): string[] => {
 };
 
 /** Заголовки, по которым цепочка и собрана, — их показываем в карточке письма. */
+/**
+ * Заголовки ответа в цепочку дела — по последнему письму в нём.
+ *
+ * Пусто, если писем нет: тогда это не ответ, а новая переписка, и выдумывать
+ * In-Reply-To не на что.
+ */
+async function replyHeaders(caseId: number): Promise<Pick<OutgoingEmail, "inReplyTo" | "references">> {
+  const emails = await db.getCaseEmails(caseId);
+  const target = emails[emails.length - 1];
+  if (!target) return {};
+  return {
+    inReplyTo: target.message_id,
+    references: [...parseReferences(target.email_references), target.message_id].join(" "),
+  };
+}
+
 function threadingHeaders(email: EmailRecord) {
   return {
     message_id: email.message_id,
@@ -201,22 +226,20 @@ async function analyzeTask(emit: Emit): Promise<void> {
     return;
   }
 
-  emit("step", { text: `Отбираю медицинскую переписку из ${threads.length} цепочек…`, progress: 0.05 });
-  const triaged = await selectMedicalThreads(db, threads);
+  emit("step", { text: `Отсеиваю мусор из ${threads.length} цепочек…`, progress: 0.05 });
+  const triaged = await selectRelevantThreads(db, threads);
   emit("step", {
-    text: `Относится к медицине: ${triaged.medical.length}, отсеяно: ${triaged.skipped}`,
+    text: `В дела: ${triaged.relevant.length}, в спам: ${triaged.spam}`,
     progress: 0.3,
   });
 
-  if (triaged.medical.length === 0) {
-    emit("failed", {
-      message: "Медицинской переписки не нашлось. Проверьте, что загружены нужные письма.",
-    });
+  if (triaged.relevant.length === 0) {
+    emit("failed", { message: "Все письма отсеяны как мусор — разбирать нечего." });
     return;
   }
 
   emit("step", { text: "Объединяю и разделяю цепочки по смыслу…", progress: 0.35 });
-  const classified = await classifyCases(db, selfAddress, triaged.medical);
+  const classified = await classifyCases(db, selfAddress, triaged.relevant);
   emit("step", {
     text:
       `Дел: ${classified.cases}` +
@@ -231,6 +254,14 @@ async function analyzeTask(emit: Emit): Promise<void> {
     emit("warn", {
       text: `${classified.orphanThreads} цепочк(а/и) не отнесены моделью ни к какому делу — заведены отдельными делами со статусом «нужен контекст».`,
     });
+  }
+
+  // Разбор собирает дела с нуля и про продолжение переписки не знает: отмена
+  // встречи, пришедшая отдельным письмом, снова легла бы отдельным делом.
+  // Склейки возвращают её на место.
+  const relinked = await db.applyThreadLinks();
+  if (relinked > 0) {
+    emit("step", { text: `Возвращено склеек переписки: ${relinked}`, progress: 0.48 });
   }
 
   await summarizeCases(db, selfAddress, (topic, index, total) => {
@@ -250,20 +281,6 @@ async function analyzeTask(emit: Emit): Promise<void> {
 }
 
 async function syncTask(emit: Emit, source: string, days: number): Promise<void> {
-  if (source === "demo") {
-    emit("step", { text: "Загружаю демо-корпус…", progress: 0.3 });
-    const result = await syncDemo(db);
-    emit("done", {
-      loaded: result.emails,
-      threads: result.threads,
-      rfc: result.rfc,
-      heuristic: result.heuristic,
-      bulk: result.bulkFiltered,
-      lostCaseLinks: result.lostCaseLinks,
-    });
-    return;
-  }
-
   if (source === "imap") {
     emit("step", { text: `Подключаюсь к ящику, беру письма за ${days} дн…`, progress: 0.1 });
     const { syncImap } = await import("../ingest/imap-sync.ts");
@@ -305,7 +322,7 @@ async function api(req: Request, url: URL): Promise<Response> {
 
   // — общее состояние —
   if (path === "/state" && method === "GET") {
-    const [cases, threadCounts, pendingCounts, stats, facts, watcher, meetings] = await Promise.all([
+    const [cases, threadCounts, pendingCounts, stats, facts, watcher, meetings, spam] = await Promise.all([
       db.getCases(),
       db.getThreadCounts(),
       db.getPendingCounts(),
@@ -313,13 +330,32 @@ async function api(req: Request, url: URL): Promise<Response> {
       db.getUserFacts(),
       db.getWatcherState(),
       db.getMeetings(),
+      db.spamThreads(),
     ]);
+
+    /**
+     * Дело, которым агент действительно занят, — ровно одно.
+     *
+     * Считается тем же кодом, что и в автопилоте, а не повторяется здесь по
+     * памяти: иначе экран рано или поздно начнёт врать. Врал он именно так —
+     * «в работе» стояло у всех ста тридцати четырёх дел, хотя агент брал в
+     * работу одно, а к остальным не прикасался вовсе.
+     *
+     * Свежесть проверяем тем же окном: письмо старше окна ответа не получит,
+     * и показывать его как взятое в работу — то же самое враньё.
+     */
+    const { findCaseToAnswer, REPLY_WINDOW_MINUTES } = await import("../agent/autopilot.ts");
+    const target = await findCaseToAnswer(db);
+    const fresh =
+      target !== null &&
+      Date.now() - Date.parse(target.newest.date_sent) <= REPLY_WINDOW_MINUTES * 60_000;
 
     return json({
       provider: { name: cfg.provider, model: cfg.models[cfg.provider] },
       self: selfAddress,
+      activeCaseId: fresh ? target!.case.id : null,
       busy,
-      stats: { ...stats, meetings: meetings.length },
+      stats: { ...stats, meetings: meetings.length, spam: spam.length },
       watcher,
       cases: cases.map((c: Case) => ({
         ...c,
@@ -343,22 +379,42 @@ async function api(req: Request, url: URL): Promise<Response> {
   // — настройки —
   if (path === "/settings" && method === "GET") {
     return json({
-      autopilot: (await db.getSetting("autopilot")) !== "off",
+      autopilot: (await db.getSetting("autopilot")) === "on",
       /** Переменной окружения интерфейс перебить не может — так и скажем. */
       autopilotLockedByEnv: process.env.AUTOPILOT === "0",
+      /** Тестовый режим: агент соглашается со всем и не задаёт вопросов человеку. */
+      agreeAll: (await db.getSetting("agree_all")) !== "off",
       mailbox: selfAddress,
       provider: cfg.provider,
       model: cfg.models[cfg.provider],
       policyFile: process.env.POLICY_FILE?.trim() || "rag_clinic_agent_v2.md",
+      /** Агент отвечает только на письма новее этого момента. */
+      replySince: await db.getSetting("reply_since"),
     });
   }
 
   if (path === "/settings" && method === "POST") {
-    const body = (await req.json().catch(() => ({}))) as { autopilot?: boolean };
+    const body = (await req.json().catch(() => ({}))) as {
+      autopilot?: boolean;
+      agreeAll?: boolean;
+      resetReplySince?: boolean;
+    };
     if (typeof body.autopilot === "boolean") {
       await db.setSetting("autopilot", body.autopilot ? "on" : "off");
     }
-    return json({ autopilot: (await db.getSetting("autopilot")) !== "off" });
+    if (typeof body.agreeAll === "boolean") {
+      await db.setSetting("agree_all", body.agreeAll ? "on" : "off");
+    }
+    // Сдвиг отсечки на «сейчас»: агент забывает накопленный ящик и отвечает
+    // только на то, что придёт дальше.
+    if (body.resetReplySince) {
+      await db.setSetting("reply_since", new Date().toISOString());
+    }
+    return json({
+      autopilot: (await db.getSetting("autopilot")) === "on",
+      agreeAll: (await db.getSetting("agree_all")) !== "off",
+      replySince: await db.getSetting("reply_since"),
+    });
   }
 
   /** Текст регламента — чтобы правила были видны из интерфейса, а не только в файле. */
@@ -377,6 +433,70 @@ async function api(req: Request, url: URL): Promise<Response> {
    * Показывает и то, что в дела не попало: письмо от клиники могло не
    * пройти отбор, и без этого списка оно было бы невидимо совсем.
    */
+  /** Отсеянное как мусор — вкладка «Спам». Видно, что именно агент выбросил. */
+  if (path === "/spam" && method === "GET") {
+    const threads = await db.spamThreads();
+    return json({
+      threads: threads.map((t) => ({
+        id: t.id,
+        subject: t.subject,
+        link_method: t.link_method,
+        message_count: t.message_count,
+        first_date: t.first_date,
+        last_date: t.last_date,
+        case_id: null,
+      })),
+    });
+  }
+
+  /**
+   * Поиск по ящику: письма и дела разом.
+   *
+   * Ищет по всей базе, а не по разобранному: письмо, не попавшее ни в одно
+   * дело, — как раз то, которое ищут руками. Подсветку ставит база
+   * (`ts_headline`), сюда она приходит помеченной управляющими символами;
+   * разметку из них делает фронт после экранирования.
+   */
+  if (path === "/search" && method === "GET") {
+    const query = (url.searchParams.get("q") ?? "").trim();
+    const limit = Math.min(Number(url.searchParams.get("limit") ?? "40") || 40, 100);
+
+    if (query.length < 2) {
+      return json({ query, cases: [], emails: [], hint: "Введите хотя бы два символа" });
+    }
+
+    const [cases, emails] = await Promise.all([
+      db.searchCases(query),
+      db.searchEmails(query, limit),
+    ]);
+
+    return json({
+      query,
+      cases: cases.map((c) => ({
+        id: c.id,
+        topic: c.topic,
+        clinic: c.clinic_name ?? c.clinic_domain ?? null,
+        status: c.status,
+        summary: c.summary,
+        last_activity: c.last_activity,
+      })),
+      emails: emails.map((e) => ({
+        id: e.id,
+        date_sent: e.date_sent,
+        from_address: e.from_address,
+        from_name: e.from_name,
+        subject: e.subject,
+        is_sent: Boolean(e.is_sent),
+        case_id: e.case_id,
+        case_topic: e.case_topic,
+        highlight: e.highlight,
+        // Полный текст нужен для раскрытия письма прямо в результатах.
+        // Длинные письма режем: список должен оставаться списком.
+        body: (e.body_text ?? e.snippet ?? "").slice(0, 4000),
+      })),
+    });
+  }
+
   if (path === "/threads" && method === "GET") {
     const threads = await db.getThreads();
     const caseByThread = await db.caseIdsForThreads(threads.map((t) => t.id!));
@@ -532,6 +652,40 @@ async function api(req: Request, url: URL): Promise<Response> {
     // Одноразовый токен удаляем до внешнего вызова: двойной клик не отправит два письма.
     pendingSends.delete(body.token!);
     const messageId = await sendEmail(pending.message);
+
+    /*
+     * Письмо, отправленное из чата, — такая же часть переписки, как ответ
+     * автопилота, и обязано быть видно в цепочке. Раньше оно уходило мимо
+     * базы совсем: на экране переписка обрывалась на письме клиники, будто
+     * агент не ответил, — и следующий разбор считал так же.
+     *
+     * Пересборка цепочек ставит его рядом с тем письмом, на которое оно
+     * отвечает: заголовки ответа проставлены при составлении.
+     */
+    const emailId = await recordSentEmail(db, {
+      messageId,
+      from: selfAddress,
+      to: pending.message.to,
+      subject: pending.message.subject,
+      body: pending.message.body,
+      inReplyTo: pending.message.inReplyTo ?? null,
+      references: pending.message.references ?? null,
+    });
+    await rebuildThreads(db);
+
+    // Если письмо составлялось по делу — цепочку с ним привязываем к делу
+    // явно. Обычно связь даёт RFC-заголовок, но письмо могло уйти на другой
+    // адрес или с новой темой, и тогда оно повисло бы отдельной перепиской.
+    if (pending.caseId !== null) {
+      try {
+        await db.addEmailToCase(emailId, pending.caseId);
+      } catch (err) {
+        // Письмо уже ушло — на ответ клиенту это не влияет, но молчать о
+        // непривязанном письме нельзя: иначе оно тихо пропадёт из дела.
+        console.log(`  ! письмо ${messageId} не привязано к делу #${pending.caseId}: ${(err as Error).message}`);
+      }
+    }
+
     return json({ sent: true, messageId });
   }
 
@@ -640,8 +794,19 @@ async function api(req: Request, url: URL): Promise<Response> {
         answer = "Для отправки нужны получатель, тема и текст. Укажите недостающие данные — адрес я угадывать не буду.";
       } else {
         const token = crypto.randomUUID();
-        const message = { to: action.to.trim(), subject: action.subject.trim(), body: action.body.trim() };
-        pendingSends.set(token, { message, expires: Date.now() + 15 * 60_000 });
+        /*
+         * Письмо из чата по конкретному делу — ответ в ту же цепочку, а не
+         * новая переписка с нуля. Заголовки берём от последнего письма дела:
+         * без них почтовый клиент клиники заведёт отдельную ветку, а наша
+         * пересборка цепочек не свяжет ответ с делом.
+         */
+        const message: OutgoingEmail = {
+          to: action.to.trim(),
+          subject: action.subject.trim(),
+          body: action.body.trim(),
+          ...(caseId !== null ? await replyHeaders(caseId) : {}),
+        };
+        pendingSends.set(token, { message, expires: Date.now() + 15 * 60_000, caseId });
         answer = `Письмо подготовлено, но ещё не отправлено.\n\nКому: ${message.to}\nТема: ${message.subject}\n\n${message.body}`;
         responseAction = { type: "confirm_send", token, ...message };
       }

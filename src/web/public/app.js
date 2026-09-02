@@ -21,8 +21,6 @@ const STATUS = {
   unclear:      "нужен контекст",
 };
 
-const LINK = { rfc: "связь по заголовкам", heuristic: "склеено эвристикой" };
-
 const fmtDate = (iso) => {
   if (!iso) return "";
   const d = new Date(iso);
@@ -45,8 +43,7 @@ function fmtAgo(iso) {
   return fmtDate(iso);
 }
 
-let state = { cases: [], stats: {}, facts: [], questions: [] };
-let filter = "action";
+let state = { cases: [], stats: {}, facts: [], questions: [], activeCaseId: null };
 /** Раскрыт ли блок вопросов без дела — переживает перерисовку списка. */
 let looseOpen = false;
 /** Раскрытые дела: список перерисовывается целиком, состояние должно жить вне разметки. */
@@ -220,47 +217,51 @@ function needsYou(c) {
 function caseState(c) {
   if (c.status === "closed") return "done";
   if (questionsFor(c.id).length > 0) return "ask";
-  // Последнее слово за нами — значит агент спросил и ждёт.
-  if (c.status === "waiting_them" || c.awaiting) return "sent";
-  return "open";
+  /*
+   * «Уточняем у клиники» — только если письмо от нас действительно ушло:
+   * последнее письмо в деле наше, и это факт из базы (`we_wrote_last`).
+   *
+   * Раньше условием были `status === "waiting_them"` и непустое `awaiting`.
+   * Оба поля пишет сводка, `awaiting` заполнен почти всегда — и жёлтая
+   * подпись «уточняем у клиники» висела на делах, куда агент не отправил ни
+   * строчки. Ровно это и было видно на экране: «уточняем у клиники» рядом с
+   * «ответить клинике, согласны ли вы на запись завтра» — то есть ход был за
+   * нами, а экран уверял, что ждём их.
+   */
+  if (c.we_wrote_last) return "sent";
+  /*
+   * «В работе» — ровно одно дело: то, где лежит последнее пришедшее письмо.
+   * Какое именно, решает сервер тем же кодом, что и автопилот.
+   *
+   * Раньше сюда проваливалось всё подряд, и «в работе» стояло у всех ста
+   * тридцати четырёх дел, включая почту недельной давности, которую агент не
+   * трогает и никогда не тронет. Экран обещал работу, которой не было.
+   */
+  return state.activeCaseId === c.id ? "open" : "idle";
 }
 
 const STATE_LABEL = {
   ask:  "нужно ваше решение",
   sent: "уточняем у клиники",
   open: "в работе",
+  idle: "в ящике",
   done: "закрыто",
 };
 
-const FILTERS = [
-  { key: "action", label: "Ждут вашего действия", match: (c) => caseState(c) === "ask" },
-  { key: "asking", label: "Уточняем у клиники",   match: (c) => caseState(c) === "sent" },
-  { key: "closed", label: "Закрытые",             match: (c) => caseState(c) === "done" },
-];
-
-/**
- * «Все письма» стоит особняком справа: остальные фильтры режут разобранные
- * дела, а он показывает сырые цепочки — включая те, что в дела не попали.
- * Письмо от клиники могло не пройти отбор, и без этого режима оно было бы
- * невидимо совсем.
+/*
+ * Раньше состояние `open` («в работе») не попадало ни в один раздел: дело
+ * было видно только в «Все письма», и то сырой цепочкой. Теперь «В процессе»
+ * забирает всё, что уже не ждёт человека и ещё не закрыто, — разделы вместе
+ * покрывают дела целиком, без дыр.
  */
-const ALL_MAIL = "allmail";
-
-function renderFilters() {
-  const chips = FILTERS.map((f) => {
-    const n = state.cases.filter(f.match).length;
-    return `<button class="chip ${filter === f.key ? "on" : ""}" role="tab"
-              aria-selected="${filter === f.key}" data-filter="${f.key}">
-              ${f.label}<span class="chip-n">${n}</span>
-            </button>`;
-  }).join("");
-
-  $("filters").innerHTML = chips +
-    `<button class="chip chip-right ${filter === ALL_MAIL ? "on" : ""}" role="tab"
-       aria-selected="${filter === ALL_MAIL}" data-filter="${ALL_MAIL}">
-       ${icon("mail")} Все письма<span class="chip-n">${state.stats.threads ?? 0}</span>
-     </button>`;
-}
+/*
+ * Фильтров нет — один общий ящик.
+ *
+ * Их убрали намеренно: разбиение по состояниям делило и без того небольшой
+ * список на разделы, где регулярно оказывалось пусто, а стартовый раздел мог
+ * не показать только что пришедшее письмо. Пока переписки немного, один
+ * список честнее — всё видно сразу и ничего не прячется за вкладкой.
+ */
 
 /** Вопрос агента прямо в списке: отвечать, не проваливаясь в карточку. */
 function questionBlock(q) {
@@ -285,72 +286,8 @@ function questionBlock(q) {
     </div>`;
 }
 
-/**
- * Все цепочки ящика, включая не попавшие ни в одно дело.
- *
- * Раскрываются на месте: отдельная страница цепочки означала бы уход с
- * главного экрана ради технической детали, а весь смысл этого экрана —
- * что уходить никуда не надо.
- */
-async function renderAllMail() {
-  const box = $("inbox-list");
-  box.innerHTML = `<div class="empty"><b>Загружаю письма…</b></div>`;
-
-  const { threads } = await api("/threads");
-  if (threads.length === 0) {
-    box.innerHTML = `<div class="empty"><b>Писем пока нет</b>
-      <p>Демон подключается к ящику и подтягивает почту сам.</p></div>`;
-    return;
-  }
-
-  box.innerHTML = threads.map((t) => `
-    <article class="row thread-row" data-thread="${t.id}">
-      <div class="row-main" role="button" tabindex="0" data-expand="${t.id}">
-        <div class="row-top">
-          <span class="pill ${t.link_method}">${LINK[t.link_method]}</span>
-          <h3 class="row-topic">${esc(t.subject || "(без темы)")}</h3>
-          <span class="row-when">${fmtAgo(t.last_date)}</span>
-        </div>
-        <div class="row-meta">
-          <span>писем: ${t.message_count}</span>
-          <span>${fmtDate(t.first_date)} — ${fmtDate(t.last_date)}</span>
-          ${t.case_id
-            ? `<a href="#/case/${t.case_id}" class="row-link-case">дело №${t.case_id}</a>`
-            : `<span class="row-nocase">в дела не попало</span>`}
-        </div>
-      </div>
-      <div class="thread-mails" hidden></div>
-    </article>`).join("");
-}
-
-/** Письма цепочки подгружаются только когда её раскрыли. */
-async function expandThread(id) {
-  const row = document.querySelector(`[data-thread="${id}"]`);
-  const box = row?.querySelector(".thread-mails");
-  if (!box) return;
-
-  if (!box.hidden) { box.hidden = true; return; }
-
-  if (!box.dataset.loaded) {
-    box.innerHTML = `<div class="mail"><span class="spin dark"></span> загружаю…</div>`;
-    box.hidden = false;
-    try {
-      const data = await api(`/threads/${id}`);
-      box.innerHTML = data.emails.map(mailCard).join("");
-      box.dataset.loaded = "1";
-    } catch (err) {
-      box.innerHTML = `<div class="mail err">${esc(err.message)}</div>`;
-    }
-    return;
-  }
-  box.hidden = false;
-}
-
 function renderInbox() {
-  renderFilters();
   const box = $("inbox-list");
-
-  if (filter === ALL_MAIL) { void renderAllMail(); return; }
 
   // Вопрос, не привязанный к делу, тоже должен быть виден: раньше он жил на
   // отдельной вкладке, и без этого блока просто исчез бы с глаз. Но свёрнут
@@ -382,13 +319,8 @@ function renderInbox() {
     return;
   }
 
-  const shown = state.cases.filter(FILTERS.find((f) => f.key === filter).match);
-
-  if (shown.length === 0) {
-    box.innerHTML = looseBlock + `<div class="empty"><b>Здесь пусто</b>
-      <p>В этой группе дел нет. Посмотрите остальные — переключите фильтр выше.</p></div>`;
-    return;
-  }
+  // Показываем всё: список один, свежее сверху (сортировка в getCases).
+  const shown = state.cases;
 
   /**
    * Свёрнутая строка: название, время и одна строка контекста.
@@ -411,7 +343,7 @@ function renderInbox() {
           <div class="row-top">
             <span class="dot-state" aria-hidden="true"></span>
             <h3 class="row-topic">${esc(c.topic)}</h3>
-            <span class="row-when">${fmtAgo(c.updated_at)}</span>
+            <span class="row-when">${c.last_activity ? fmtAgo(c.last_activity) : ""}</span>
           </div>
           <p class="row-context">
             <span class="row-clinic">${esc(clinic)}</span>
@@ -452,12 +384,6 @@ function caseDetails(c) {
 // Один делегированный обработчик на весь список — карточки перерисовываются
 // целиком, и вешать слушатели на каждую кнопку значило бы их терять.
 $("inbox-list").addEventListener("click", async (e) => {
-  // Ссылка на дело внутри строки цепочки не должна раскрывать саму цепочку.
-  if (e.target.closest(".row-link-case")) return;
-
-  const expand = e.target.closest("[data-expand]");
-  if (expand) return void expandThread(expand.dataset.expand);
-
   const toggle = e.target.closest("[data-toggle]");
   if (toggle) {
     const id = toggle.dataset.toggle;
@@ -504,14 +430,6 @@ $("inbox-list").addEventListener("keydown", (e) => {
 $("inbox-list").addEventListener("toggle", (e) => {
   if (e.target.classList?.contains("loose")) looseOpen = e.target.open;
 }, true);
-
-$("filters").addEventListener("click", (e) => {
-  const chip = e.target.closest("[data-filter]");
-  if (!chip) return;
-  // Фильтр живёт в адресе: иначе на «Требуют вас» нельзя дать ссылку,
-  // а обновление страницы сбрасывает выбор.
-  location.hash = `#/inbox/${chip.dataset.filter}`;
-});
 
 async function sendAnswer(id, value) {
   if (!String(value || "").trim()) return toast("Напишите ответ", true);
@@ -617,7 +535,6 @@ async function renderCase(id) {
       <div class="thread">
         <div class="thread-head">
           <span class="t">${esc(t.subject || "(без темы)")}</span>
-          <span class="pill ${t.link_method}">${LINK[t.link_method]}</span>
           <span class="n">писем: ${t.message_count}</span>
         </div>
         ${t.emails.map(mailCard).join("")}
@@ -808,6 +725,9 @@ async function loadSettings() {
     $("set-mailbox").textContent = s.mailbox;
     $("set-model").textContent = `${s.provider} · ${s.model}`;
     $("set-policy").textContent = s.policyFile;
+    $("since-note").textContent = s.replySince
+      ? `Отвечает только на письма после ${fmtDate(s.replySince)}. Накопленный ящик не трогает.`
+      : "Отсечка не поставлена — будет выставлена при первом заходе агента.";
     $("profile-mail").textContent = s.mailbox;
 
     const toggle = $("autopilot-toggle");
@@ -819,6 +739,11 @@ async function loadSettings() {
       : s.autopilot
         ? "сам отвечает клиникам по регламенту"
         : "на паузе — письма клиникам не уходят";
+
+    $("agree-toggle").checked = s.agreeAll;
+    $("agree-note").textContent = s.agreeAll
+      ? "принимает любое предложенное время и отвечает утвердительно, вопросов вам не задаёт"
+      : "разбирает по регламенту: сверяет календарь и спрашивает вас по §6";
   } catch (err) {
     toast(err.message, true);
   }
@@ -835,6 +760,27 @@ $("autopilot-toggle").onchange = async (e) => {
     toast(err.message, true);
   }
 };
+
+// Тестовый режим: пока агент не сверяется с настоящим календарём компании,
+// он со всем соглашается — иначе переписка встаёт на первом же уточнении.
+$("agree-toggle").onchange = async (e) => {
+  const on = e.target.checked;
+  try {
+    await api("/settings", { method: "POST", body: JSON.stringify({ agreeAll: on }) });
+    toast(on ? "Соглашается со всем — тестовый режим" : "Работает по регламенту");
+    await loadSettings();
+  } catch (err) {
+    e.target.checked = !on;
+    toast(err.message, true);
+  }
+};
+
+$("b-reset-since").onclick = (e) => withBusy(e.currentTarget, async () => {
+  // Сдвиг отсечки на «сейчас»: всё, что уже лежит в ящике, агент забывает.
+  await api("/settings", { method: "POST", body: JSON.stringify({ resetReplySince: true }) });
+  toast("Готово: агент отвечает только на письма с этого момента");
+  await loadSettings();
+});
 
 $("b-policy").onclick = async (e) => withBusy(e.currentTarget, async () => {
   const { text } = await api("/policy");
@@ -865,22 +811,27 @@ window.analyze = async () => {
 $("b-reanalyze").onclick = window.analyze;
 $("b-reanalyze-2").onclick = () => { closeDrawer(); window.analyze(); };
 
-$("b-demo").onclick = async () => {
-  closeDrawer();
-  const ok = await runJob("Загрузка демо-корпуса", "/api/sync?source=demo");
-  await refresh();
-  if (ok) { location.hash = "#/inbox"; route(); }
-};
-
 // ─── Живое обновление ───────────────────────────────────────────────────────
 
-let lastEmailCount = null;
+let lastEmailCount = 0;
+let lastSignature = null;
 
 /**
  * Письма кладёт в базу демон, а не эта вкладка. Поэтому опрашиваем состояние:
  * дешёвый /pulse вместо полного /state, и перерисовываем текущий экран только
  * когда писем действительно стало больше.
  */
+/**
+ * Слепок состояния, по которому решаем, надо ли перерисовывать.
+ *
+ * Раньше сравнивалось только число писем — и список не обновлялся там, где
+ * это важнее всего: письмо приходит, счётчик растёт, дела ещё нет (разбор
+ * идёт минуты), а когда дело наконец появляется, число писем уже прежнее,
+ * и перерисовка не срабатывает. Экран оставался устаревшим до следующего
+ * случайного письма.
+ */
+const signature = (s) => `${s.emails}|${s.cases}|${s.threads}|${s.pending}`;
+
 async function pulse() {
   if (!$("scrim").hidden) return; // идёт долгая операция, модалка и так всё показывает
 
@@ -890,10 +841,14 @@ async function pulse() {
 
     $("n-emails").textContent = stats.emails;
 
-    if (lastEmailCount !== null && stats.emails > lastEmailCount) {
-      toast(`Пришло писем: ${stats.emails - lastEmailCount}`);
+    const next = signature(stats);
+    if (lastSignature !== null && next !== lastSignature) {
+      if (stats.emails > lastEmailCount) {
+        toast(`Пришло писем: ${stats.emails - lastEmailCount}`);
+      }
       await route();
     }
+    lastSignature = next;
     lastEmailCount = stats.emails;
   } catch {
     // Сервер перезапускают — молча ждём следующего тика.
@@ -902,11 +857,189 @@ async function pulse() {
 
 setInterval(pulse, 10_000);
 
+// ─── Поиск по ящику ─────────────────────────────────────────────────────────
+
+/*
+ * Поиск идёт по всей базе, а не по разобранной переписке: письмо, не попавшее
+ * ни в одно дело, — как раз то, которое ищут руками.
+ *
+ * Подсветку ставит база: только она знает, какие словоформы совпали
+ * («медос» → «медосмотр»). Границы приходят управляющими символами, и это
+ * важно для безопасности: текст письма сначала экранируется целиком, и лишь
+ * потом метки превращаются в теги. Разметка из письма разметкой не станет.
+ */
+const HL_START = String.fromCharCode(1);
+const HL_STOP = String.fromCharCode(2);
+
+const marked = (text) =>
+  esc(text ?? "").split(HL_START).join("<mark>").split(HL_STOP).join("</mark>");
+
+const searchInput = $("search-input");
+let searchTimer = null;
+let searchSeq = 0;
+/** Какие письма в выдаче раскрыты — список перерисовывается целиком. */
+const expandedMail = new Set();
+
+function goSearch(query) {
+  const q = query.trim();
+  location.hash = q ? `#/search/${encodeURIComponent(q)}` : "#/inbox";
+}
+
+searchInput.addEventListener("input", () => {
+  $("search-clear").hidden = !searchInput.value;
+  // Пауза перед запросом: иначе каждый набранный символ уходит в базу.
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => goSearch(searchInput.value), 250);
+});
+
+$("search-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  clearTimeout(searchTimer);
+  goSearch(searchInput.value);
+});
+
+searchInput.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    searchInput.value = "";
+    $("search-clear").hidden = true;
+    clearTimeout(searchTimer);
+    location.hash = "#/inbox";
+  }
+});
+
+$("search-clear").onclick = () => {
+  searchInput.value = "";
+  $("search-clear").hidden = true;
+  searchInput.focus();
+  location.hash = "#/inbox";
+};
+
+$("b-search-back").onclick = () => { location.hash = "#/inbox"; };
+
+// «/» ставит курсор в поиск — привычка почтовых клиентов. Но только когда
+// не пишут в другом поле: иначе слэш перестанет набираться.
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "/" || e.metaKey || e.ctrlKey || e.altKey) return;
+  const tag = document.activeElement?.tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA") return;
+  e.preventDefault();
+  searchInput.focus();
+  searchInput.select();
+});
+
+/** Карточка найденного письма. Свёрнута: раскрывается по щелчку. */
+function foundMail(m) {
+  const who = m.from_name ? `${m.from_name} <${m.from_address}>` : m.from_address;
+  const open = expandedMail.has(String(m.id));
+
+  return `
+    <article class="found ${m.is_sent ? "out" : ""} ${open ? "is-open" : ""}">
+      <div class="found-main" role="button" tabindex="0" data-mail="${m.id}" aria-expanded="${open}">
+        <div class="found-top">
+          <span class="found-dir">${m.is_sent ? "мы" : "вход"}</span>
+          <b class="found-subj">${esc(m.subject || "(без темы)")}</b>
+          <span class="found-when">${fmtDate(m.date_sent)}</span>
+        </div>
+        <p class="found-meta">
+          <span class="found-who">${esc(who)}</span>
+          ${m.case_id
+            ? `<span class="found-case">${esc(m.case_topic || `дело #${m.case_id}`)}</span>`
+            : `<span class="found-nocase">вне дел</span>`}
+        </p>
+        <p class="found-hl">${marked(m.highlight) || esc((m.body || "").slice(0, 160))}</p>
+      </div>
+      ${open
+        ? `<div class="found-body">
+             <div class="mail-body open">${esc(m.body || "(пустое письмо)")}</div>
+             ${m.case_id
+               ? `<button class="btn small" data-goto-case="${m.case_id}">Открыть переписку</button>`
+               : `<p class="found-note">Письмо не входит ни в одно дело — агент его не ведёт.</p>`}
+           </div>`
+        : ""}
+    </article>`;
+}
+
+async function renderSearch(rawQuery) {
+  const query = decodeURIComponent(rawQuery ?? "");
+  const box = $("search-body");
+
+  if (searchInput.value !== query) searchInput.value = query;
+  $("search-clear").hidden = !query;
+  $("search-title").textContent = `Поиск: ${query}`;
+
+  if (query.trim().length < 2) {
+    $("search-sub").textContent = "Введите хотя бы два символа.";
+    box.innerHTML = "";
+    return;
+  }
+
+  // Ответы могут прийти не в том порядке, в каком уходили запросы: держим
+  // номер последнего и рисуем только его — иначе на экране осядет выдача
+  // по недобранному слову.
+  const mine = ++searchSeq;
+  $("search-sub").textContent = "Ищу…";
+
+  const data = await api(`/search?q=${encodeURIComponent(query)}`);
+  if (mine !== searchSeq) return;
+
+  const total = data.cases.length + data.emails.length;
+  $("search-sub").textContent = total === 0
+    ? "Ничего не найдено — попробуйте другое слово, адрес или часть темы."
+    : `Дел: ${data.cases.length} · писем: ${data.emails.length}`;
+
+  box.innerHTML = total === 0
+    ? `<div class="empty">
+         <b>Пусто</b>
+         <p>Поиск идёт по теме, тексту письма и адресу — включая письма, которые
+            не попали ни в одно дело.</p>
+       </div>`
+    : `
+      ${data.cases.length
+        ? `<p class="section-title">Дела · ${data.cases.length}</p>
+           ${data.cases.map((c) => `
+             <article class="found found-case-row" role="button" tabindex="0" data-goto-case="${c.id}">
+               <div class="found-top">
+                 <b class="found-subj">${esc(c.topic)}</b>
+                 <span class="found-when">${c.last_activity ? fmtAgo(c.last_activity) : ""}</span>
+               </div>
+               <p class="found-meta">
+                 <span class="found-who">${esc(c.clinic || "клиника не определена")}</span>
+                 <span class="found-case">${esc(STATUS[c.status] || c.status)}</span>
+               </p>
+               ${c.summary ? `<p class="found-hl">${esc(c.summary)}</p>` : ""}
+             </article>`).join("")}`
+        : ""}
+      ${data.emails.length
+        ? `<p class="section-title">Письма · ${data.emails.length}</p>
+           ${data.emails.map(foundMail).join("")}`
+        : ""}`;
+}
+
+$("search-body").addEventListener("click", (e) => {
+  const toCase = e.target.closest("[data-goto-case]");
+  if (toCase) return void (location.hash = `#/case/${toCase.dataset.gotoCase}`);
+
+  const mail = e.target.closest("[data-mail]");
+  if (mail) {
+    const id = mail.dataset.mail;
+    expandedMail.has(id) ? expandedMail.delete(id) : expandedMail.add(id);
+    renderSearch(encodeURIComponent(searchInput.value));
+  }
+});
+
+$("search-body").addEventListener("keydown", (e) => {
+  if (e.key !== "Enter" && e.key !== " ") return;
+  const target = e.target.closest("[data-mail], [data-goto-case]");
+  if (!target) return;
+  e.preventDefault();
+  target.click();
+});
+
 // ─── Роутинг ────────────────────────────────────────────────────────────────
 
 // Экранов осталось два: список переписки и карточка дела. Чат живёт в доке
 // поверх них, поэтому маршрутом не является.
-const VIEWS = ["inbox", "case"];
+const VIEWS = ["inbox", "search", "case"];
 
 async function route() {
   const [name = "inbox", arg] = location.hash.replace(/^#\/?/, "").split("/");
@@ -916,12 +1049,13 @@ async function route() {
 
   for (const v of VIEWS) $(`v-${v}`).hidden = v !== view;
 
+  // В карточке дела поиска нет: там читают одну переписку, а не ищут по ящику,
+  // и строка над кнопкой «Вся переписка» только сбивала бы с толку.
+  $("search-form").hidden = view === "case";
+
   try {
-    if (view === "inbox") {
-      const known = FILTERS.some((f) => f.key === arg) || arg === ALL_MAIL;
-      if (known) filter = arg;
-      renderInbox();
-    }
+    if (view === "inbox") renderInbox();
+    if (view === "search") await renderSearch(arg);
     if (view === "case")  await renderCase(arg);
   } catch (err) {
     toast(err.message, true);

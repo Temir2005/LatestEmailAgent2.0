@@ -1,7 +1,7 @@
 import type { ClinicDB } from "../../db/db.ts";
 import { classifyCases } from "../../llm/classify.ts";
 import { summarizeCases } from "../../llm/summarize.ts";
-import { selectMedicalThreads } from "../../llm/triage.ts";
+import { selectRelevantThreads } from "../../llm/triage.ts";
 import { bold, dim, green, heading, red, renderCaseLine, yellow } from "../render.ts";
 
 export async function runCases(
@@ -25,13 +25,13 @@ export async function runCases(
     // дешёвый отбор по отправителю и теме — тела писем на этом шаге не
     // отправляются никуда.
     process.stdout.write(dim(`  отбираю медицинскую переписку из ${allThreads.length} цепочек… `));
-    const triaged = await selectMedicalThreads(db, allThreads);
+    const triaged = await selectRelevantThreads(db, allThreads);
     console.log(green("готово"));
     console.log(
-      dim(`  относится к медицине: ${triaged.medical.length}, отсеяно: ${triaged.skipped}`),
+      dim(`  относится к медицине: ${triaged.relevant.length}, отсеяно: ${triaged.spam}`),
     );
 
-    if (triaged.medical.length === 0) {
+    if (triaged.relevant.length === 0) {
       console.log(
         `\n${yellow("Медицинской переписки не нашлось.")} ` +
           `Проверьте, что синканы нужные письма: ${bold("bun run sync --imap --days 90")}`,
@@ -40,7 +40,7 @@ export async function runCases(
     }
 
     process.stdout.write(dim("  объединяю и разделяю цепочки по смыслу… "));
-    const classified = await classifyCases(db, selfAddress, triaged.medical);
+    const classified = await classifyCases(db, selfAddress, triaged.relevant);
     console.log(green("готово"));
     console.log(
       dim(
