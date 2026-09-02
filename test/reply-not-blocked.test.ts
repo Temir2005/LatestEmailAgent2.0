@@ -56,7 +56,6 @@ describe("занятый разбор не запирает ответ", () => {
       [{ kind: "to", address: "me@gmail.com", name: null }],
     );
     await rebuildThreads(db);
-    await db.markLatestIncomingAsNew();
 
     // Разбор занят — ровно то состояние, в котором ответ раньше не начинался.
     expect(await db.acquireAnalysisLock("веб")).toBe(true);

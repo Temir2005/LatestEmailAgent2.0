@@ -47,6 +47,19 @@ imapUtf7.decode = (value: string): string =>
     return decoded;
   });
 
+/**
+ * Сколько ждать ответа на команду, прежде чем считать соединение мёртвым.
+ *
+ * У node-imap своего таймаута на команды нет: колбэк `openBox` или `search`
+ * может не позвать никогда, и `await` висит до конца жизни процесса. Именно
+ * так демон и замолчал — сокет был жив, сервер честно слал события о новых
+ * письмах, а догон стоял на невыполненной команде и держал свой флаг.
+ *
+ * Минута — с огромным запасом: и открытие папки, и UID SEARCH отвечают за
+ * доли секунды. Выборку писем сюда не заводим — она законно бывает долгой.
+ */
+const COMMAND_TIMEOUT_MS = (Number(process.env.IMAP_COMMAND_TIMEOUT_SECONDS ?? "60") || 60) * 1000;
+
 /** Донорский лимит: письмо крупнее просто не тянем в память. */
 const MAX_MESSAGE_BYTES = 50 * 1024 * 1024;
 /** Донорский размер пакета — выборка идёт параллельно, по пачкам. */
@@ -63,6 +76,8 @@ export class ImapClient {
   private connected = false;
   private onMail: ((count: number) => void) | null = null;
   private onDown: ((err?: Error) => void) | null = null;
+  /** Тот же обработчик, но без проверки `connected`: нужен для тайм-аута. */
+  private downRaw: ((err: Error | null) => void) | null = null;
 
   constructor(private readonly creds: ImapCredentials) {
     this.imap = new Imap({
@@ -142,8 +157,43 @@ export class ImapClient {
     this.imap.end();
   }
 
-  openFolder(folder: string, readOnly = true): Promise<FolderState> {
+  /**
+   * Команда с ограничением по времени.
+   *
+   * Молчащая команда хуже ошибки: ошибку видно в логе, а молчание выглядит
+   * как исправно работающий демон, который просто ничего не находит.
+   */
+  private timed<T>(what: string, task: Promise<T>): Promise<T> {
     return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const err = new Error(`IMAP молчит ${COMMAND_TIMEOUT_MS / 1000} с на команде «${what}»`);
+        this.giveUp(err);
+        reject(err);
+      }, COMMAND_TIMEOUT_MS);
+
+      task.then(
+        (value) => { clearTimeout(timer); resolve(value); },
+        (err) => { clearTimeout(timer); reject(err); },
+      );
+    });
+  }
+
+  /**
+   * Соединение больше не отвечает: рвём его и говорим об этом наверх.
+   *
+   * Через `downRaw`, а не через обработчик из `onDisconnect`: тот сначала
+   * смотрит на `connected`, и после снятия флага молча вышел бы, оставив
+   * демон без переподключения.
+   */
+  private giveUp(err: Error): void {
+    if (!this.connected) return;
+    this.connected = false;
+    try { this.imap.destroy(); } catch { /* сокет и так мёртв */ }
+    this.downRaw?.(err);
+  }
+
+  openFolder(folder: string, readOnly = true): Promise<FolderState> {
+    return this.timed(`открыть папку ${folder}`, new Promise<FolderState>((resolve, reject) => {
       this.imap.openBox(folder, readOnly, (err, box) => {
         if (err) return reject(new Error(`Не открылась папка ${folder}: ${err.message}`));
         resolve({
@@ -152,7 +202,7 @@ export class ImapClient {
           total: box.messages.total,
         });
       });
-    });
+    }));
   }
 
   /** Gmail локализует «Вся почта», поэтому ищем её по IMAP-атрибуту \All. */
@@ -180,12 +230,12 @@ export class ImapClient {
 
   /** UID писем по критериям IMAP-поиска. */
   search(criteria: unknown[]): Promise<number[]> {
-    return new Promise((resolve, reject) => {
+    return this.timed("поиск писем", new Promise<number[]>((resolve, reject) => {
       this.imap.search(criteria as any, (err, uids) => {
         if (err) return reject(new Error(`IMAP-поиск не удался: ${err.message}`));
         resolve(uids ?? []);
       });
-    });
+    }));
   }
 
   /**
@@ -352,6 +402,7 @@ export class ImapClient {
     };
 
     this.onDown = wrapped;
+    this.downRaw = handler;
     this.imap.on("error", wrapped);
     this.imap.on("close", wrapped);
     this.imap.on("end", wrapped);

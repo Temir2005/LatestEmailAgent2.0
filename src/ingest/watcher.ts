@@ -62,11 +62,59 @@ interface ClientHandle {
   imap: ImapClient;
 }
 
+// ─── Уведомление веба ───────────────────────────────────────────────────────
+
+/**
+ * Стук в веб: «привёз почту» или «ответил клинике».
+ *
+ * Демон и веб — разные процессы, и до этого веб узнавал о новом письме
+ * только тем, что вкладка раз в десять секунд спрашивала счётчики. Теперь
+ * демон говорит сам, а веб будит открытые вкладки — письмо появляется на
+ * экране сразу.
+ *
+ * Ошибки глотаем сознательно: веб может быть выключен, и почта из-за этого
+ * останавливаться не должна. Опрос в браузере остался запасным путём, так
+ * что несостоявшийся стук стоит секунды задержки, а не потерянного письма.
+ * Жалуемся в лог один раз подряд, чтобы не забивать его каждые десять секунд.
+ */
+let webUnreachable = false;
+
+async function notifyWeb(payload: { loaded?: number; sent?: number }): Promise<void> {
+  const url = cfg.webUrl.trim();
+  if (!url) return;
+
+  try {
+    await fetch(`${url.replace(/\/$/, "")}/api/internal/mail-arrived`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-agent-secret": cfg.webhookSecret },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(1500),
+    });
+    webUnreachable = false;
+  } catch (err) {
+    if (!webUnreachable) {
+      webUnreachable = true;
+      log(`! веб не отвечает на уведомление (${(err as Error).message}) — вкладки обновятся опросом`);
+    }
+  }
+}
+
 // ─── Схлопывание приходов ───────────────────────────────────────────────────
 
 let pendingPull: ReturnType<typeof setTimeout> | null = null;
 /** Догон уже идёт: второй параллельный сломал бы sync_state. */
 let pulling = false;
+/** Когда начался идущий догон — по нему видно зависший. */
+let pullStartedAt = 0;
+/**
+ * Дольше этого догон не живёт.
+ *
+ * Команда IMAP без ответа не роняет ничего: флаг `pulling` остаётся поднятым
+ * навсегда, и каждый следующий заход — и опрос, и событие от сервера — молча
+ * упирается в него. Снаружи это выглядит хуже всего: демон «работает», пульс
+ * идёт, сервер сообщает о новых письмах, а в ящике их нет.
+ */
+const PULL_STUCK_MS = (Number(process.env.WATCH_STUCK_MINUTES ?? "5") || 5) * 60_000;
 /** Пока шёл догон, пришло ещё — повторить сразу после. */
 let pullAgain = false;
 /** Ответ уже готовится: второй параллельный отправит клинике второе письмо. */
@@ -85,15 +133,44 @@ function schedulePull(reason: string): void {
   }, DEBOUNCE_MS);
 }
 
+/**
+ * Спасение из зависшего догона: рвём соединение и подключаемся заново.
+ *
+ * Оборванная команда после этого отвалится сама — сокета под ней уже нет.
+ * `scheduleReconnect` зовём явно: `disconnect()` снимает флаг соединения, и
+ * обработчик разрыва после него уже не срабатывает.
+ */
+function rescueStuckPull(): void {
+  log(
+    `! догон висит ${Math.round((Date.now() - pullStartedAt) / 60_000)} мин — ` +
+      `рву соединение и подключаюсь заново`,
+  );
+
+  pulling = false;
+  pullAgain = false;
+
+  const dead = client;
+  client = null;
+  try {
+    dead?.imap.unwatch();
+    dead?.imap.disconnect();
+  } catch { /* соединение и так мёртвое */ }
+
+  void db.setWatcherStatus("reconnecting", "догон завис, переподключаюсь");
+  scheduleReconnect();
+}
+
 async function pull(reason: string): Promise<void> {
   if (stopping) return;
   if (pulling) {
     pullAgain = true;
+    if (Date.now() - pullStartedAt > PULL_STUCK_MS) rescueStuckPull();
     return;
   }
   if (!client?.imap.isConnected) return;
 
   pulling = true;
+  pullStartedAt = Date.now();
   let wantAutopilot = false;
   try {
     const result = await syncFolder(db, client.imap, FOLDER, INITIAL_DAYS, (m) => log(`! ${m}`));
@@ -128,13 +205,10 @@ async function pull(reason: string): Promise<void> {
     const adopted = await db.adoptUncasedThreads();
     if (adopted > 0) log(`новых цепочек в ящике: ${adopted}`);
 
-    // Признак «новое» ставится здесь, в момент загрузки, и ровно одному
-    // письму. Дальше агент работает только с ним; вся остальная база для
-    // него не существует.
-    const fresh = await db.markLatestIncomingAsNew();
-    if (fresh) log(`новое письмо: «${fresh.subject ?? "без темы"}»`);
-
     await db.setWatcherStatus("watching", `последнее письмо: ${new Date().toISOString()}`);
+
+    // Письма уже в базе и разложены по цепочкам — можно будить вкладки.
+    await notifyWeb({ loaded: result.loaded });
 
     // Автопилот запускаем ПОСЛЕ снятия замка, ниже: он ходит в LLM и держать
     // за собой загрузку почты не имеет права.
@@ -208,6 +282,10 @@ async function runReplySafely(selfAddress: string, reason: string): Promise<void
       `ответ (${reason}): отправлено ${auto.sent}, пропущено ${auto.skipped}, ` +
         `ошибок ${auto.errors}`,
     );
+
+    // Наш собственный ответ — тоже новость для экрана: письмо появляется в
+    // переписке, а дело меняет состояние.
+    if (auto.sent > 0) await notifyWeb({ sent: auto.sent });
   } catch (err) {
     noteFailure(`ответ (${reason})`, err as Error);
   } finally {
@@ -262,14 +340,27 @@ async function connect(): Promise<void> {
   await imap.connect();
   client = { imap };
 
-  // Первым делом — забрать всё, что пришло, пока демона не было.
-  const caught = await syncFolder(db, imap, FOLDER, INITIAL_DAYS, (m) => log(`! ${m}`));
-  if (caught.loaded > 0) {
-    const rebuilt = await rebuildThreads(db);
-    await db.recordWatcherMail(caught.loaded);
-    log(`догон при старте: +${caught.loaded} писем, цепочек ${rebuilt.threads}`);
-  } else {
-    log(`догон при старте: нового нет`);
+  /*
+   * Первым делом — забрать всё, что пришло, пока демона не было. Под тем же
+   * флагом, что и обычный догон: страховочный опрос тикает каждые десять
+   * секунд и во время старта успевал влезть со своим `syncFolder` в то же
+   * соединение. Две выборки в одном соединении и две пересборки цепочек в
+   * одной базе — так девятиминутная пересборка и получилась, а следом одна
+   * из команд осталась без ответа навсегда.
+   */
+  pulling = true;
+  pullStartedAt = Date.now();
+  try {
+    const caught = await syncFolder(db, imap, FOLDER, INITIAL_DAYS, (m) => log(`! ${m}`));
+    if (caught.loaded > 0) {
+      const rebuilt = await rebuildThreads(db);
+      await db.recordWatcherMail(caught.loaded);
+      log(`догон при старте: +${caught.loaded} писем, цепочек ${rebuilt.threads}`);
+    } else {
+      log(`догон при старте: нового нет`);
+    }
+  } finally {
+    pulling = false;
   }
 
   // На старте — тоже до автопилота: демон мог лежать как раз тогда, когда

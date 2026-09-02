@@ -314,11 +314,100 @@ async function syncTask(emit: Emit, source: string, days: number): Promise<void>
   emit("failed", { message: `Неизвестный источник: ${source}` });
 }
 
+// ─── Живой канал в браузер ──────────────────────────────────────────────────
+
+/**
+ * Открытые вкладки, ждущие новостей.
+ *
+ * Раньше вкладка узнавала о новом письме только на своём опросе — раз в
+ * десять секунд. Теперь демон, привезя почту, стучится в ручку ниже, а она
+ * будит все вкладки разом: письмо появляется на экране сразу.
+ *
+ * Опрос в браузере при этом остался. Он и страховка на случай оборванного
+ * соединения, и единственный способ показать, что дело вышло из работы: это
+ * происходит от времени, а не от события, и уведомлять тут некому.
+ */
+const liveClients = new Set<ReadableStreamDefaultController<Uint8Array>>();
+const sseEncoder = new TextEncoder();
+
+function pushToClients(frame: string): void {
+  const chunk = sseEncoder.encode(frame);
+  for (const client of [...liveClients]) {
+    try {
+      client.enqueue(chunk);
+    } catch {
+      // Вкладку закрыли, а `cancel` ещё не пришёл — выкидываем сами.
+      liveClients.delete(client);
+    }
+  }
+}
+
+/**
+ * Пульс в открытые соединения.
+ *
+ * Без него молчащий канал закрывается по дороге — и прокси, и сам сервер
+ * (`idleTimeout`) считают такое соединение брошенным. Двоеточие в начале
+ * строки — комментарий SSE: клиент его получает и игнорирует.
+ */
+setInterval(() => pushToClients(": пульс\n\n"), 25_000);
+
 // ─── Маршруты ───────────────────────────────────────────────────────────────
 
 async function api(req: Request, url: URL): Promise<Response> {
   const path = url.pathname.replace(/^\/api/, "");
   const method = req.method;
+
+  /**
+   * Живой канал: вкладка держит его открытым и ждёт события «пришла почта».
+   *
+   * Своего состояния канал не отдаёт — только повод обновиться. Данные
+   * вкладка всё равно берёт обычными запросами: так один код рисует экран и
+   * по событию, и по опросу.
+   */
+  if (path === "/events" && method === "GET") {
+    let mine: ReadableStreamDefaultController<Uint8Array> | null = null;
+
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        mine = controller;
+        liveClients.add(controller);
+        controller.enqueue(sseEncoder.encode(": канал открыт\n\n"));
+      },
+      cancel() {
+        if (mine) liveClients.delete(mine);
+      },
+    });
+
+    return new Response(stream, {
+      headers: {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache",
+        connection: "keep-alive",
+        // Nginx и подобные буферизуют ответ и держат события у себя.
+        "x-accel-buffering": "no",
+      },
+    });
+  }
+
+  /**
+   * Внутренняя ручка: демон сообщает, что привёз почту или ответил клинике.
+   *
+   * Ничего не меняет и ничего не отдаёт наружу — только будит вкладки.
+   * Секрет здесь не про тайну переписки, а про то, чтобы ручку не дёргал кто
+   * попало: в докере оба сервиса получают его из одной переменной.
+   */
+  if (path === "/internal/mail-arrived" && method === "POST") {
+    if (req.headers.get("x-agent-secret") !== cfg.webhookSecret) {
+      return fail("Не тот секрет", 403);
+    }
+
+    const body = (await req.json().catch(() => ({}))) as { loaded?: number; sent?: number };
+    pushToClients(
+      `event: mail\ndata: ${JSON.stringify({ loaded: body.loaded ?? 0, sent: body.sent ?? 0 })}\n\n`,
+    );
+
+    return json({ ok: true, listeners: liveClients.size });
+  }
 
   // — общее состояние —
   if (path === "/state" && method === "GET") {
@@ -334,26 +423,29 @@ async function api(req: Request, url: URL): Promise<Response> {
     ]);
 
     /**
-     * Дело, которым агент действительно занят, — ровно одно.
+     * Дела, которыми агент занят прямо сейчас.
      *
      * Считается тем же кодом, что и в автопилоте, а не повторяется здесь по
      * памяти: иначе экран рано или поздно начнёт врать. Врал он именно так —
      * «в работе» стояло у всех ста тридцати четырёх дел, хотя агент брал в
      * работу одно, а к остальным не прикасался вовсе.
      *
-     * Свежесть проверяем тем же окном: письмо старше окна ответа не получит,
-     * и показывать его как взятое в работу — то же самое враньё.
+     * Очередь та же: цепочки, где последнее письмо входящее и не старше окна
+     * ответа. Ответит агент не более чем на `MAX_REPLIES_PER_RUN` из них за
+     * заход, но в работе они все — и экран показывает именно это.
      */
-    const { findCaseToAnswer, REPLY_WINDOW_MINUTES } = await import("../agent/autopilot.ts");
-    const target = await findCaseToAnswer(db);
-    const fresh =
-      target !== null &&
-      Date.now() - Date.parse(target.newest.date_sent) <= REPLY_WINDOW_MINUTES * 60_000;
+    const { casesInWork, REPLY_WINDOW_MINUTES } = await import("../agent/autopilot.ts");
+    const queue = await casesInWork(db, await db.getSetting("reply_since"));
 
     return json({
       provider: { name: cfg.provider, model: cfg.models[cfg.provider] },
       self: selfAddress,
-      activeCaseId: fresh ? target!.case.id : null,
+      activeCaseIds: queue.map((item) => item.case.id),
+      /**
+       * Окно работы — то же самое, что у агента. Экран не считает его сам:
+       * иначе однажды разойдётся с тем, что агент на самом деле делает.
+       */
+      replyWindowMinutes: REPLY_WINDOW_MINUTES,
       busy,
       stats: { ...stats, meetings: meetings.length, spam: spam.length },
       watcher,

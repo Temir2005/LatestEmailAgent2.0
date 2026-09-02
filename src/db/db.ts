@@ -695,56 +695,87 @@ export class ClinicDB {
   }
 
   /**
-   * Помечает последнее пришедшее письмо как новое — и снимает признак со всех
-   * остальных.
+   * Дела «в работе»: очередь агента.
    *
-   * Новым может быть ровно одно письмо. Это не оптимизация, а правило: агент
-   * работает только с ним, а вся остальная база для него не существует.
-   * Раньше он перебирал все дела подряд, и каждое из полутора сотен
-   * становилось кандидатом на ответ — достаточно одной ошибки отбора, чтобы
-   * письмо ушло постороннему. Так и случалось, дважды.
+   * В работе — цепочка, в которой последнее письмо пришло не от нас и не
+   * старше окна. Всё остальное считается законченным и в работу не берётся
+   * вовсе: агент не должен трогать накопленный ящик, а старая переписка,
+   * которую никто не продолжает, ответа уже не ждёт.
    *
-   * Порядок — по `created_at`, времени попадания в базу, а не по дате из
-   * заголовка письма. Эти два порядка расходятся: письмо могло пролежать на
-   * сервере или прийти с неверными часами отправителя. «Последнее пришедшее»
-   * означает именно последнее загруженное.
+   * Закрытое дело сюда попадает наравне с прочими, если клиника написала
+   * после нас: новое письмо возвращает переписку в работу. Закрытым и
+   * невидимым для агента оно остаётся ровно до этого момента.
    *
-   * Исходящие не в счёт: отвечать на собственное письмо нечего.
+   * Порядок — от старых к новым: письмо, пришедшее раньше, раньше и получит
+   * ответ. Иначе при потоке писем самое первое из них так и осталось бы без
+   * ответа, вытесняемое каждым следующим.
    */
-  async markLatestIncomingAsNew(): Promise<{ id: number; subject: string | null } | null> {
-    return this.sql.begin(async (tx) => {
-      await tx`UPDATE emails SET is_new = FALSE WHERE is_new`;
-
-      const [row] = await tx`
-        UPDATE emails SET is_new = TRUE
-         WHERE id = (
-           SELECT id FROM emails
-            WHERE NOT is_sent
-            ORDER BY created_at DESC, id DESC
-            LIMIT 1
+  async casesInWork(options: {
+    /** Сколько минут письмо считается свежим. */
+    withinMinutes: number;
+    /** Отсечка: письма старше неё агенту недоступны. */
+    since?: string | null;
+    limit?: number;
+  }): Promise<Array<{ case: Case; newest: EmailRecord }>> {
+    const rows = await this.sql`
+      WITH newest AS (
+        SELECT DISTINCT ON (ct.case_id)
+               ct.case_id, e.id AS email_id
+          FROM case_threads ct
+          JOIN emails e ON e.thread_id = ct.thread_id
+         ORDER BY ct.case_id, e.date_sent DESC, e.id DESC
+      )
+      SELECT c.*, e.* , c.id AS case_id, e.id AS email_id
+        FROM newest n
+        JOIN cases c ON c.id = n.case_id
+        JOIN emails e ON e.id = n.email_id
+       WHERE NOT e.is_sent
+         AND e.date_sent > now() - ${`${options.withinMinutes} minutes`}::interval
+         AND (${options.since ?? null}::timestamptz IS NULL
+              OR e.date_sent >= ${options.since ?? null}::timestamptz)
+         /*
+          * Отсеянное отбором в работу не берём.
+          *
+          * Обычно мусор до дел не доходит: adoptUncasedThreads его не
+          * заводит. Но вердикт отбора мог появиться позже дела, а очередь
+          * теперь берёт не одно письмо, а все свежие: пропущенная рассылка
+          * означала бы ответ агента магазину кроссовок.
+          */
+         AND NOT EXISTS (
+           SELECT 1
+             FROM threads t
+             JOIN triage_verdicts v ON v.root_message_id = t.root_message_id
+            WHERE t.id = e.thread_id AND NOT v.is_relevant
          )
-        RETURNING id, subject`;
+       ORDER BY e.date_sent ASC
+       LIMIT ${options.limit ?? 20}`;
 
-      return row ? { id: row.id as number, subject: (row.subject as string) ?? null } : null;
-    });
+    /*
+     * `SELECT c.*, e.*` склеивает две строки в одну, и одноимённые столбцы
+     * (id, created_at) затирают друг друга — поэтому дело и письмо читаем по
+     * явным псевдонимам, а не из общей каши.
+     */
+    return rows.map((r: Record<string, unknown>) => ({
+      case: { ...toCase(r), id: r.case_id as number },
+      newest: { ...toEmail(r), id: r.email_id as number },
+    }));
   }
 
-  /** Письмо, помеченное новым, вместе с делом, в котором оно лежит. */
-  async newEmailWithCase(): Promise<{ email: EmailRecord; caseId: number | null } | null> {
+  /**
+   * Уходило ли от нас письмо по этому делу после указанного момента.
+   *
+   * Страховка от второго ответа на одно и то же письмо. Обычно от него
+   * защищает сама переписка: отправленное письмо ложится в базу и становится
+   * последним, а дело с нашим письмом в конце в работу не берётся. Но если
+   * SMTP отработал, а запись в базу сорвалась, письмо клинике уже ушло — и
+   * без этой проверки следующий заход отправил бы второе.
+   */
+  async hasSentSince(caseId: number, iso: string): Promise<boolean> {
     const [row] = await this.sql`
-      SELECT e.*, (
-        SELECT ct.case_id FROM case_threads ct WHERE ct.thread_id = e.thread_id LIMIT 1
-      ) AS case_id
-        FROM emails e
-       WHERE e.is_new
+      SELECT 1 FROM drafts
+       WHERE case_id = ${caseId} AND sent_at IS NOT NULL AND sent_at > ${iso}::timestamptz
        LIMIT 1`;
-    if (!row) return null;
-    return { email: toEmail(row), caseId: (row.case_id as number) ?? null };
-  }
-
-  /** Снимает признак новизны: письмо отработано, больше к нему не возвращаемся. */
-  async clearNewFlag(): Promise<void> {
-    await this.sql`UPDATE emails SET is_new = FALSE WHERE is_new`;
+    return Boolean(row);
   }
 
   /** Отсеянное — то, что показывается в «Спаме». */
@@ -1066,8 +1097,20 @@ export class ClinicDB {
       await tx`UPDATE clarifications SET case_id = ${intoId} WHERE case_id = ${fromId}`;
       await tx`UPDATE meetings SET case_id = ${intoId} WHERE case_id = ${fromId}`;
       await tx`DELETE FROM cases WHERE id = ${fromId}`;
-      // Дело ожило: в него приехала новая переписка, и сводку надо пересчитать.
-      await tx`UPDATE cases SET updated_at = now() WHERE id = ${intoId}`;
+
+      /*
+       * Дело ожило: в него приехала новая переписка.
+       *
+       * Закрытое дело после слияния закрытым не остаётся — иначе свежее
+       * письмо оказывается внутри «завершённого» и уезжает в конец списка
+       * вместе с ним. Сводку тоже пересчитываем: она написана без этой части
+       * переписки.
+       */
+      await tx`
+        UPDATE cases
+           SET status = CASE WHEN status = 'closed' THEN 'open' ELSE status END,
+               updated_at = now()
+         WHERE id = ${intoId}`;
     });
   }
 

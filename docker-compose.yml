@@ -10,6 +10,11 @@ x-app: &app
   env_file: .env
   environment:
     CLINIC_DATABASE_URL: postgres://clinic:clinic@db:5432/clinic
+    # Демон стучится сюда, привезя почту, а веб будит открытые вкладки.
+    # Секрет общий у обоих сервисов: ручка только будит экран, но дёргать её
+    # кто попало не должен.
+    WEB_URL: ${WEB_URL:-http://web:3001}
+    WEBHOOK_SECRET: ${WEBHOOK_SECRET:-clinic-agent-local}
   depends_on:
     db:
       condition: service_healthy
@@ -49,6 +54,7 @@ services:
     entrypoint: ["bun", "run", "src/web/server.ts"]
     environment:
       CLINIC_DATABASE_URL: postgres://clinic:clinic@db:5432/clinic
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-clinic-agent-local}
       # Дозагрузку уже держит сервис worker — второй демон внутри web не нужен.
       EMBED_WATCHER: "0"
     ports:

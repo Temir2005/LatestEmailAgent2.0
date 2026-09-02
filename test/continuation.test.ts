@@ -16,6 +16,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { ClinicDB } from "../src/db/db.ts";
 import { freshTestDb, SKIP_NOTE } from "./helpers/pg.ts";
 import { rebuildThreads } from "../src/ingest/sync.ts";
+import { attachToContinuedCase } from "../src/llm/continuation.ts";
 import type { Case } from "../src/types.ts";
 
 let db: ClinicDB | null = null;
@@ -98,6 +99,73 @@ describe("слияние дела-продолжения", () => {
     expect(await db.getCaseThreads(meetingCase)).toHaveLength(2);
     expect(await db.getCaseEmails(meetingCase)).toHaveLength(2);
     expect(await db.lastSentAction(meetingCase)).toBe("clarify");
+  });
+});
+
+describe("что склеивать нельзя", () => {
+  /**
+   * Каскад из живого прогона: три разные переписки — «Re: Med Treatment»,
+   * «Re: Это мед центр Эмирмед» и «Re: Предложение о сотрудничестве» — уехали
+   * в одно дело. Все они отвечали на наш вопрос про дату и время и со стороны
+   * модели выглядели одинаково, а каждое слияние делало дело крупнее и
+   * притягательнее для следующего.
+   *
+   * Родство таких писем уже доказано заголовками. Мнение модели здесь ничего
+   * не добавляет — только рушит переписку.
+   */
+  test("письмо внутри своей цепочки к чужому делу не приклеивается", async () => {
+    if (!db) return console.log(SKIP_NOTE);
+
+    await standaloneMail(db, "<own-1@medline.kz>", "Своя переписка", "2026-09-01T08:00:00Z");
+    await db.insertEmail({
+      message_id: "<own-2@medline.kz>",
+      in_reply_to: "<own-1@medline.kz>",
+      email_references: "<own-1@medline.kz>",
+      date_sent: "2026-09-01T08:30:00Z",
+      subject: "Re: Своя переписка",
+      normalized_subject: "своя переписка",
+      from_address: CLINIC,
+      body_text: "Давайте 5 сентября в 18:00",
+      is_sent: false,
+      folder: "INBOX",
+    });
+    await rebuildThreads(db);
+
+    const thread = (await db.getThreads()).find((t) => t.root_message_id === "<own-1@medline.kz>")!;
+    const ownCase = await db.createCaseWithThreads(CASE("Своя переписка"), [thread.id!]);
+    const emails = await db.getCaseEmails(ownCase);
+    const newest = emails[emails.length - 1]!;
+
+    // Модель даже не спрашивается: письмо стоит в своей цепочке по заголовкам.
+    const result = await attachToContinuedCase(db, ownCase, newest);
+
+    expect(result.mergedInto).toBeNull();
+    expect(await db.getCaseById(ownCase)).not.toBeNull();
+  });
+});
+
+describe("продолжение оживляет дело", () => {
+  test("в закрытое дело приехало письмо — дело снова в работе", async () => {
+    if (!db) return console.log(SKIP_NOTE);
+
+    await standaloneMail(db, "<bye-1@medline.kz>", "Спасибо за встречу", "2026-09-01T11:00:00Z");
+    await standaloneMail(db, "<again-1@medline.kz>", "Насчет переноса", "2026-09-01T12:00:00Z");
+    await rebuildThreads(db);
+
+    const threads = await db.getThreads();
+    const finished = threads.find((t) => t.root_message_id === "<bye-1@medline.kz>")!;
+    const again = threads.find((t) => t.root_message_id === "<again-1@medline.kz>")!;
+
+    const closedCase = await db.createCaseWithThreads(CASE("Спасибо за встречу"), [finished.id!]);
+    const freshCase = await db.createCaseWithThreads(CASE("Насчет переноса"), [again.id!]);
+    // Агент попрощался и закрыл переписку — а клиника написала снова.
+    await db.updateCaseStatus(closedCase, "closed");
+
+    await db.mergeCases(freshCase, closedCase);
+
+    // Иначе свежее письмо оказывается внутри «завершённого» дела и вместе с
+    // ним уезжает в конец списка.
+    expect((await db.getCaseById(closedCase))!.status).toBe("open");
   });
 });
 

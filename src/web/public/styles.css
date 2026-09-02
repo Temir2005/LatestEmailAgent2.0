@@ -253,25 +253,38 @@ h1, h2, h3 { line-height: 1.25; }
 .row:hover { box-shadow: var(--shadow-lift); }
 
 /* Состояние — цветной кромкой слева и точкой у названия. Цвет не единственный
-   носитель: рядом всегда стоит подпись словами. */
-.row.st-ask  { box-shadow: inset 4px 0 0 var(--stop), var(--shadow); }
-.row.st-sent { box-shadow: inset 4px 0 0 var(--warn-dot), var(--shadow); }
-.row.st-done { opacity: .72; }
-/* Единственное дело, которым агент занят прямо сейчас, — с полосой навигации.
-   Остальные (st-idle) остаются нейтральными: агент их не трогает. */
-.row.st-open { box-shadow: inset 4px 0 0 var(--navy), var(--shadow); }
-.row.st-ask:hover  { box-shadow: inset 4px 0 0 var(--stop), var(--shadow-lift); }
-.row.st-sent:hover { box-shadow: inset 4px 0 0 var(--warn-dot), var(--shadow-lift); }
-.row.st-open:hover { box-shadow: inset 4px 0 0 var(--navy), var(--shadow-lift); }
+   носитель: рядом всегда стоит подпись словами.
+
+   Идущая переписка синяя вся, независимо от того, чей ход: для человека это
+   одно состояние — «работа не закончена». Красная точка внутри синей полосы
+   выделяет единственный случай, где работа стоит и ждёт именно его. */
+.row.st-wait,
+.row.st-ours,
+.row.st-reply { box-shadow: inset 4px 0 0 var(--navy), var(--shadow); }
+.row.st-ask   { box-shadow: inset 4px 0 0 var(--stop), var(--shadow); }
+.row.st-done  { opacity: .68; }
+.row.st-wait:hover,
+.row.st-ours:hover,
+.row.st-reply:hover { box-shadow: inset 4px 0 0 var(--navy), var(--shadow-lift); }
+.row.st-ask:hover   { box-shadow: inset 4px 0 0 var(--stop), var(--shadow-lift); }
 
 .dot-state {
   width: 8px; height: 8px; border-radius: 50%; flex: none;
   background: var(--navy-line);
 }
-.st-ask  .dot-state { background: var(--stop); }
-.st-sent .dot-state { background: var(--warn-dot); }
-.st-done .dot-state { background: #C4C4C9; }
-.st-open .dot-state { background: var(--navy); }
+.st-wait  .dot-state { background: var(--navy); }
+.st-ours  .dot-state { background: var(--navy); }
+.st-reply .dot-state { background: var(--navy); animation: pulse 2.4s infinite; }
+.st-ask   .dot-state { background: var(--stop); }
+.st-done  .dot-state { background: #C4C4C9; }
+
+/* Подпись состояния: словами, потому что цвет читают не все и не всегда. */
+.row-state { font-weight: 700; }
+.st-ask   .row-state { color: var(--stop); }
+.st-wait  .row-state,
+.st-ours  .row-state,
+.st-reply .row-state { color: var(--navy); }
+.st-done  .row-state { color: var(--muted); font-weight: 600; }
 
 /* Свёрнутая строка: название, время, одна строка контекста. Больше в списке
    не нужно — подробности раскрываются по щелчку. */
@@ -298,9 +311,6 @@ h1, h2, h3 { line-height: 1.25; }
   margin: 3px 0 0 16px; font-size: 12.5px; color: var(--muted); min-width: 0;
 }
 .row-clinic { color: var(--shield); }
-.row-state { font-weight: 700; }
-.st-ask  .row-state { color: var(--stop); }
-.st-sent .row-state { color: var(--warn); }
 .row-next {
   color: var(--muted); min-width: 0;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -429,11 +439,13 @@ h1, h2, h3 { line-height: 1.25; }
   padding: 2px 9px; border-radius: 11px;
   font-size: 11.5px; font-weight: 700; white-space: nowrap;
 }
-.pill.open         { background: var(--navy-soft); color: var(--navy); }
-.pill.waiting_them { background: var(--warn-bg);   color: var(--warn); }
-.pill.waiting_us   { background: var(--stop-bg);   color: var(--stop); }
-.pill.closed       { background: #EEEEF0;          color: var(--shield); }
-.pill.unclear      { background: var(--stop-bg);   color: var(--stop); }
+/* Те же два вида, что и в списке: идёт (синий) или закончено (серый);
+   красным — единственный случай, когда работа ждёт человека. */
+.pill.st-wait, .pill.st-reply, .pill.st-ours,
+.pill.open, .pill.waiting_them,
+.pill.waiting_us, .pill.unclear { background: var(--navy-soft); color: var(--navy); }
+.pill.st-ask                    { background: var(--stop-bg);   color: var(--stop); }
+.pill.st-done, .pill.closed     { background: #EEEEF0;          color: var(--shield); }
 
 /* ─── Лента писем ────────────────────────────────────────────────────────── */
 

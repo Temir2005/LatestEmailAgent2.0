@@ -15,6 +15,20 @@ export interface Config {
   /** Строка подключения к PostgreSQL. */
   databaseUrl: string;
   authSocket: string;
+  /**
+   * Адрес веба изнутри системы: по нему демон стучится, когда привёз почту,
+   * а веб будит открытые вкладки. Пустая строка выключает уведомление —
+   * тогда экран обновляется своим опросом, как раньше.
+   */
+  webUrl: string;
+  /**
+   * Общий секрет внутренней ручки уведомления. Не про тайну переписки —
+   * ручка только будит вкладки, — а про то, чтобы её не дёргал кто попало.
+   *
+   * Только латиница и цифры: секрет уходит HTTP-заголовком, а заголовки не
+   * переносят кириллицу — на проверке такой секрет молча не совпал.
+   */
+  webhookSecret: string;
 }
 
 const HOME = join(homedir(), ".clinic-agent");
@@ -35,6 +49,8 @@ const DEFAULTS: Config = {
   heuristicWindowDays: 30,
   databaseUrl: "postgres://clinic:clinic@localhost:5434/clinic",
   authSocket: join(HOME, "auth.sock"),
+  webUrl: "http://localhost:3001",
+  webhookSecret: "clinic-agent-local",
 };
 
 let cached: Config | null = null;
@@ -61,6 +77,10 @@ export function loadConfig(): Config {
   // часто экспортирована глобально в профиле оболочки под совсем другой
   // проект, и агент молча писал бы медицинскую переписку в чужую базу.
   const envDbUrl = process.env.CLINIC_DATABASE_URL?.trim();
+  // Внутри docker-compose веб зовётся `web`, снаружи — localhost. Пустая
+  // строка выключает уведомление совсем.
+  const envWebUrl = process.env.WEB_URL?.trim();
+  const envSecret = process.env.WEBHOOK_SECRET?.trim();
 
   cached = {
     ...DEFAULTS,
@@ -73,6 +93,8 @@ export function loadConfig(): Config {
     },
     ...(envProvider ? { provider: envProvider } : {}),
     ...(envDbUrl ? { databaseUrl: envDbUrl } : {}),
+    ...(envWebUrl !== undefined ? { webUrl: envWebUrl } : {}),
+    ...(envSecret ? { webhookSecret: envSecret } : {}),
   };
 
   return cached;

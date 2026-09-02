@@ -96,9 +96,20 @@
           <p>Все письма в одном списке, свежие сверху. Агент отвечает по регламенту,
              а там, где решать вам, — спрашивает прямо в карточке.</p>
         </div>
-        <div class="actions">
-          <button class="btn" id="b-reanalyze">Разобрать заново</button>
-        </div>
+      </div>
+
+      <!-- Два вида переписки: идущая и законченная. Счётчик на каждом —
+           чтобы не щёлкать вслепую по пустому разделу. -->
+      <div class="filters" id="inbox-filters" role="tablist" aria-label="Вид переписки" hidden>
+        <button class="chip on" type="button" data-filter="all" role="tab" aria-selected="true">
+          Все <span class="chip-n" id="n-all">0</span>
+        </button>
+        <button class="chip" type="button" data-filter="work" role="tab" aria-selected="false">
+          В работе <span class="chip-n" id="n-work">0</span>
+        </button>
+        <button class="chip" type="button" data-filter="done" role="tab" aria-selected="false">
+          Завершённые <span class="chip-n" id="n-done">0</span>
+        </button>
       </div>
 
       <div id="inbox-list"></div>

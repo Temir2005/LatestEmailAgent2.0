@@ -47,8 +47,28 @@ export async function attachToContinuedCase(
 ): Promise<ContinuationResult> {
   const none: ContinuationResult = { mergedInto: null, why: "" };
 
+  const threads = await db.getCaseThreads(caseId);
+
   // Дело из нескольких цепочек уже собрано разбором — не вмешиваемся.
-  if ((await db.getCaseThreads(caseId)).length !== 1) return none;
+  if (threads.length !== 1) return none;
+
+  /**
+   * Склеивать можно только письмо, у которого нет своего места.
+   *
+   * Это письмо, пришедшее отдельным: без In-Reply-To и первое в своей
+   * цепочке. Если же заголовки уже связали его с перепиской — вопрос родства
+   * решён, и решён доказательно; мнение модели здесь ничего не добавляет, а
+   * навредить может.
+   *
+   * Без этого правила очередь агента устроила каскад: «Re: Med Treatment»,
+   * «Re: Это мед центр Эмирмед» и «Re: Предложение о сотрудничестве» — три
+   * разных переписки, каждая со своей историей, — уехали в одно дело
+   * «How about a coffee». Все они отвечали на наш вопрос про дату и время, и
+   * со стороны модели выглядели одинаково; а каждое слияние делало дело
+   * крупнее и притягательнее для следующего.
+   */
+  const thread = threads[0]!;
+  if (thread.message_count > 1 || newest.in_reply_to) return none;
 
   const candidates = await db.recentCasesWith(newest.from_address, caseId);
   if (candidates.length === 0) return none;
@@ -79,6 +99,19 @@ export async function attachToContinuedCase(
   // Номер вне списка — не решение модели, а её фантазия: игнорируем.
   const target = candidates.find((c) => c.id === result.continues_case_id);
   if (!target) return none;
+
+  /*
+   * Сухой прогон обязан быть сухим целиком.
+   *
+   * Он задуман как «покажи, что сделал бы», и не отправлять письма мало:
+   * слияние дел — такое же изменение, только внутри базы. На проверке
+   * очереди этот прогон молча склеил три переписки в одну, и разбирать
+   * пришлось вручную.
+   */
+  if (process.env.AUTOPILOT_DRY_RUN === "1") {
+    log(`[сухой прогон] письмо «${newest.subject ?? "без темы"}» приклеил бы к делу #${target.id} «${target.topic}» (${result.why})`);
+    return none;
+  }
 
   /*
    * Склейку записываем ДО слияния: после него дело нового письма исчезнет

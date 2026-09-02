@@ -17,7 +17,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { ClinicDB } from "../src/db/db.ts";
 import { freshTestDb, SKIP_NOTE } from "./helpers/pg.ts";
 import { rebuildThreads } from "../src/ingest/sync.ts";
-import { findCaseToAnswer } from "../src/agent/autopilot.ts";
+import { casesInWork } from "../src/agent/autopilot.ts";
 import { fixWeekdayIn, looksLikeGoodbye, looksLikeRefusal } from "../src/agent/policy.ts";
 
 let db: ClinicDB | null = null;
@@ -101,22 +101,23 @@ describe("закрытое дело слышит новое письмо", () =>
       folder: isSent ? "Sent" : "INBOX",
     });
 
-    await db.insertEmail(mail("<c1@medline.kz>", CLINIC, false, "2026-09-01T09:00:00Z"));
-    await db.insertEmail(mail("<r1@gmail.com>", SELF, true, "2026-09-01T09:05:00Z"));
+    // Время относительное: в работу берутся письма свежее окна ответа.
+    const minutesAgo = (n: number) => new Date(Date.now() - n * 60_000).toISOString();
+
+    await db.insertEmail(mail("<c1@medline.kz>", CLINIC, false, minutesAgo(4)));
+    await db.insertEmail(mail("<r1@gmail.com>", SELF, true, minutesAgo(3)));
     // Клиника ответила на наше письмо — очередь снова наша.
-    await db.insertEmail(mail("<c2@medline.kz>", CLINIC, false, "2026-09-01T09:06:00Z"));
+    await db.insertEmail(mail("<c2@medline.kz>", CLINIC, false, minutesAgo(2)));
     await rebuildThreads(db);
     await db.adoptUncasedThreads();
 
     const [c] = await db.getCases();
     // Сводка закрыла дело — раньше это выбрасывало его из работы навсегда.
     await db.updateCaseStatus(c!.id!, "closed");
-    await db.markLatestIncomingAsNew();
 
-    const target = await findCaseToAnswer(db);
+    const queue = await casesInWork(db, null);
 
-    expect(target).not.toBeNull();
-    expect(target!.newest.message_id).toBe("<c2@medline.kz>");
+    expect(queue.map((item) => item.newest.message_id)).toContain("<c2@medline.kz>");
   });
 });
 
